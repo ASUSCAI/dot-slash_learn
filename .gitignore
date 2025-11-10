@@ -1,0 +1,7 @@
+virtualenv/
+__pycache__/
+qdrant_storage/
+EMBEDDING_STRATEGY.md
+MULTI_COURSE_EXAMPLE.md
+README_GROUPS.md
+visualize_embeddings.py

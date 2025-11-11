@@ -24,7 +24,8 @@ SUBJECT_CONFIG = {
     'cs': {
         'collection': 'cs_materials',
         'groups_paths': [
-            'data/computer_science/6_0001/coursework_mappings.json'
+            'data/computer_science/6_0001/coursework_mappings.json',
+            'data/computer_science/6_006/coursework_mappings.json'
         ],
         'display_name': 'Computer Science'
     },

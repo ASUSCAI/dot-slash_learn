@@ -71,12 +71,16 @@ class DocumentReranker:
         Returns:
             Relevance score (higher = more relevant)
         """
+        # Truncate document to prevent OOM (keep first 3000 chars, ~750 tokens)
+        if len(document) > 3000:
+            document = document[:3000] + "..."
+
         inputs = self.rerank_tokenizer(
             query,
             document,
             return_tensors='pt',
             truncation=True,
-            max_length=8192,
+            max_length=4096,  # Reduced from 8192 to save memory
             padding=True
         )
 
@@ -96,6 +100,10 @@ class DocumentReranker:
             else:
                 # Single output score
                 relevance_score = logits[0, 0].cpu().item()
+
+        # Clear CUDA cache after each scoring to prevent memory accumulation
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
 
         return relevance_score
 

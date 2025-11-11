@@ -274,16 +274,16 @@ class QueryEngine:
             file_type = self._determine_file_type(file_ext)
 
             # Create a pseudo-document with the same structure as Qdrant documents
-            # Store full text for reranking (reranker only uses content_preview anyway)
+            # Limit content_preview to prevent OOM during reranking
             pseudo_doc = {
                 'payload': {
                     'file_path': file_path,
                     'file_type': file_type,
                     'course': 'N/A',  # We don't have this info for on-the-fly docs
-                    'content_preview': text_content[:8000],  # More content for better reranking
+                    'content_preview': text_content[:3000],  # Reduced to save memory during reranking
                     'content_length': len(text_content),
                     'loaded_from_disk': True,  # Flag to indicate this was loaded on-the-fly
-                    'full_content': text_content  # Store full content for potential use
+                    'full_content': text_content[:5000]  # Limit full content too
                 },
                 'score': 0.0,
                 'id': f'disk_{hash(file_path)}'  # Generate a pseudo-ID

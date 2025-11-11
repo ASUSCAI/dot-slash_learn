@@ -77,7 +77,7 @@ SUBJECT_CONFIG = {
 }
 
 
-def embed_subject(subject_key, config, qdrant_host = 'localhost', qdrant_port = 6333, exclude_extensions = None):
+def embed_subject(subject_key, config, qdrant_host = 'localhost', qdrant_port = 6444, exclude_extensions = None):
     print(f"\n{'='*70}")
     print(f"Embedding {config['display_name']} ({subject_key})")
     print(f"{'='*70}\n")
@@ -141,7 +141,7 @@ def main():
         help = 'Subjects to embed (default: all)'
     )
     parser.add_argument('--host', type = str, default = 'localhost', help = 'Qdrant host')
-    parser.add_argument('--port', type = int, default = 6333, help = 'Qdrant port')
+    parser.add_argument('--port', type = int, default = 6444, help = 'Qdrant port')
     parser.add_argument(
         '--exclude-extensions',
         nargs = '+',

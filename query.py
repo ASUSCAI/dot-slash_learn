@@ -29,7 +29,7 @@ from transformers import AutoTokenizer, AutoModel
 
 class QueryEngine:
 
-    def __init__(self, qdrant_host: str = 'localhost', qdrant_port: int = 6333, collection_name: str = 'cs_materials'):
+    def __init__(self, qdrant_host: str = 'localhost', qdrant_port: int = 6444, collection_name: str = 'cs_materials'):
         self.collection_name = collection_name
 
         # Setup device

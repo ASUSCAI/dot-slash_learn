@@ -18,7 +18,7 @@ from query import QueryEngine
 
 class LLMQuerySystem:
 
-    def __init__(self, collection_name: str = 'cs_materials', qdrant_host: str = 'localhost', qdrant_port: int = 6444):
+    def __init__(self, collection_name: str = 'cs_materials', qdrant_host: str = 'localhost', qdrant_port: int = 6333):
         """
         Initialize the LLM query system with RAG.
 

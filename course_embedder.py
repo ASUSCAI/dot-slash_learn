@@ -10,7 +10,7 @@ Usage:
 
     embedder = CourseEmbedder(
         qdrant_host = 'localhost',
-        qdrant_port = 6444,
+        qdrant_port = 6333,
         collection_name = 'course_materials',
         exclude_extensions=['.py', '.txt']
     )
@@ -34,7 +34,7 @@ from qdrant_client.models import Distance, VectorParams, PointStruct
 
 class CourseEmbedder:
 
-    def __init__(self, qdrant_host: str = 'localhost', qdrant_port: int = 6444, collection_name: str = 'course_materials', exclude_extensions: List[str] = None, exclude_filenames: List[str] = None):
+    def __init__(self, qdrant_host: str = 'localhost', qdrant_port: int = 6333, collection_name: str = 'course_materials', exclude_extensions: List[str] = None, exclude_filenames: List[str] = None):
         self.exclude_extensions = exclude_extensions or []
         self.exclude_filenames = exclude_filenames or []
 
@@ -205,7 +205,7 @@ class CourseEmbedder:
 if __name__ == '__main__':
     embedder = CourseEmbedder(
         qdrant_host = 'localhost',
-        qdrant_port = 6444,
+        qdrant_port = 6333,
         collection_name = 'course_materials',
         exclude_extensions=['.py', '.txt']
     )

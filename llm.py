@@ -14,11 +14,12 @@ import torch
 from typing import List, Dict, Any, Tuple
 from transformers import AutoTokenizer, AutoModelForImageTextToText, AutoProcessor
 from query import QueryEngine
+from guardrails import SafetyGuardrails
 
 
 class LLMQuerySystem:
 
-    def __init__(self, collection_name: str = 'cs_materials', qdrant_host: str = 'localhost', qdrant_port: int = 6333):
+    def __init__(self, collection_name: str = 'cs_materials', qdrant_host: str = 'localhost', qdrant_port: int = 6333, enable_guardrails: bool = True):
         """
         Initialize the LLM query system with RAG.
 
@@ -26,6 +27,7 @@ class LLMQuerySystem:
             collection_name: Qdrant collection to search
             qdrant_host: Qdrant host address
             qdrant_port: Qdrant port
+            enable_guardrails: Whether to enable safety guardrails
         """
         # Setup device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -40,6 +42,15 @@ class LLMQuerySystem:
             qdrant_port=qdrant_port,
             collection_name=collection_name
         )
+
+        # Initialize guardrails (on CPU to save VRAM)
+        self.enable_guardrails = enable_guardrails
+        self.guardrails = None
+        if self.enable_guardrails:
+            print('\n' + '='*80)
+            print('INITIALIZING GUARDRAILS')
+            print('='*80)
+            self.guardrails = SafetyGuardrails(device='cpu', verbose=True)
 
         # Don't load LLM yet - we'll lazy load it after RAG to save VRAM
         self.llm = None
@@ -107,6 +118,21 @@ class LLMQuerySystem:
         Returns:
             LLM response string
         """
+        # GUARDRAIL CHECKPOINT 1: Validate input query
+        if self.enable_guardrails:
+            print('\n' + '='*80)
+            print('GUARDRAIL CHECK: Validating Input Query')
+            print('='*80)
+
+            is_safe, reason = self.guardrails.validate_input(user_query)
+
+            if not is_safe:
+                print(f'\n✗ QUERY BLOCKED: {reason}')
+                print('='*80)
+                return f"I cannot process this query. Reason: {reason}"
+
+            print('='*80)
+
         # Stage 1 & 2: Perform RAG with two-stage reranking
         print('\n' + '='*80)
         print('RETRIEVING RELEVANT DOCUMENTS')
@@ -189,6 +215,38 @@ Answer:"""
         if "Answer:" in response:
             response = response.split("Answer:")[-1].strip()
 
+        # GUARDRAIL CHECKPOINT 2: Validate output response
+        if self.enable_guardrails:
+            print('\n' + '='*80)
+            print('GUARDRAIL CHECK: Validating Output Response')
+            print('='*80)
+
+            # Extract content from documents for grounding check
+            context_texts = []
+            for result, score in documents:
+                payload = result['payload']
+                content = payload.get('full_content', payload.get('content_preview', ''))
+                context_texts.append(content)
+
+            is_safe, reason, sanitized_response = self.guardrails.validate_output(
+                query=user_query,
+                response=response,
+                context=context_texts,
+                check_hallucination=True,
+                check_pii=True
+            )
+
+            if not is_safe:
+                print(f'\n✗ RESPONSE BLOCKED: {reason}')
+                print('='*80)
+                return f"I generated a response, but it failed safety validation. Reason: {reason}"
+
+            # Use sanitized response if PII was redacted
+            if sanitized_response:
+                response = sanitized_response
+
+            print('='*80)
+
         return response
 
 
@@ -216,11 +274,19 @@ def main():
         default=2048,
         help='Maximum length of generated response (default: 2048)'
     )
+    parser.add_argument(
+        '--no-guardrails',
+        action='store_true',
+        help='Disable safety guardrails (not recommended)'
+    )
 
     args = parser.parse_args()
 
     # Initialize system
-    system = LLMQuerySystem(collection_name=args.collection)
+    system = LLMQuerySystem(
+        collection_name=args.collection,
+        enable_guardrails=not args.no_guardrails
+    )
 
     # Query
     response = system.query(

@@ -76,12 +76,20 @@ class QueryEngine:
 
         return embedding.cpu().numpy().tolist()
 
-    def search(self, query: str, top_k: int = 3, use_reranker: bool = False, rerank_candidates: int = 30, verbose: bool = True):
+    def search(self, query: str, top_k: int = 3, use_reranker: bool = False, rerank_candidates: int = 50, stage1_top_k: int = 7, verbose: bool = True):
         """
         Search for relevant documents with two-stage reranking.
 
-        With chunking enabled, documents are split into chunks, so we retrieve
-        more candidates (default: 30) to ensure good coverage.
+        Pipeline:
+        1. Retrieve top 50 candidates from vector search
+        2. STAGE 1: Rerank to get top 7
+        3. Expand top 7 with neighboring chunks
+        4. STAGE 2: Rerank expanded set to get final top_k (default: 3)
+
+        Args:
+            top_k: Final number of documents to return (default: 3)
+            rerank_candidates: Number of initial candidates to retrieve (default: 50)
+            stage1_top_k: Number of documents to keep after stage 1 rerank (default: 7)
 
         Returns:
             List of tuples: (result_dict, rerank_score)
@@ -125,23 +133,23 @@ class QueryEngine:
 
             reranker = DocumentReranker(verbose=verbose)
 
-            # STAGE 1: First rerank to get top 3
+            # STAGE 1: First rerank to get top N (default: 7)
             if verbose:
                 print('='*80)
                 print('STAGE 1: Initial Reranking')
                 print('='*80)
             first_rerank = reranker.rerank(query, results_list)
-            top_3_initial = first_rerank[:3]
+            top_n_initial = first_rerank[:stage1_top_k]
 
             # STAGE 2: Expand with neighboring chunks
             if verbose:
                 print('='*80)
                 print('STAGE 2: Expanding with Neighboring Chunks')
                 print('='*80)
-            expanded_results = self._expand_with_siblings(top_3_initial, results_list, verbose=verbose)
+            expanded_results = self._expand_with_siblings(top_n_initial, results_list, verbose=verbose)
 
             if verbose:
-                print(f'\nExpanded from {len(top_3_initial)} to {len(expanded_results)} chunks (including neighbors)')
+                print(f'\nExpanded from {len(top_n_initial)} to {len(expanded_results)} chunks (including neighbors)')
                 print('\n' + '='*80)
                 print('STAGE 2: Final Reranking')
                 print('='*80)

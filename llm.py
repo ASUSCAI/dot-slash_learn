@@ -140,9 +140,10 @@ class LLMQuerySystem:
 
         documents = self.query_engine.search(
             query=user_query,
-            top_k=3,
+            top_k=3,               # Final number of documents to pass to LLM
             use_reranker=True,
-            rerank_candidates=30,  # Increased for chunk-level retrieval
+            rerank_candidates=50,  # Retrieve 50 candidates from vector search
+            stage1_top_k=7,        # Keep top 7 after first rerank, then expand with neighbors
             verbose=True
         )
 

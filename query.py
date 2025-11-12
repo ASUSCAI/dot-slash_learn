@@ -133,15 +133,15 @@ class QueryEngine:
             first_rerank = reranker.rerank(query, results_list)
             top_3_initial = first_rerank[:3]
 
-            # STAGE 2: Expand with sibling files and rerank again
+            # STAGE 2: Expand with neighboring chunks
             if verbose:
                 print('='*80)
-                print('STAGE 2: Expanding with Related Files')
+                print('STAGE 2: Expanding with Neighboring Chunks')
                 print('='*80)
             expanded_results = self._expand_with_siblings(top_3_initial, results_list, verbose=verbose)
 
             if verbose:
-                print(f'\nExpanded from {len(top_3_initial)} to {len(expanded_results)} documents (including siblings)')
+                print(f'\nExpanded from {len(top_3_initial)} to {len(expanded_results)} chunks (including neighbors)')
                 print('\n' + '='*80)
                 print('STAGE 2: Final Reranking')
                 print('='*80)
@@ -212,27 +212,31 @@ class QueryEngine:
                             if verbose:
                                 print(f"  ✓ Added chunk {neighbor_idx+1}/{total_chunks}")
 
-            else:
-                # Original behavior: expand with sibling files
-                sibling_paths = payload.get('sibling_files', [])
-
-                if sibling_paths:
-                    if verbose:
-                        print(f"\nFinding siblings for: {payload.get('file_path', 'N/A').split('/')[-1]}")
-                        print(f"  Looking for {len(sibling_paths)} sibling file(s)...")
-
-                    found_count = 0
-                    for sibling_path in sibling_paths:
-                        # Try to find this sibling in our original results
-                        sibling_result = self._find_document_by_path(sibling_path, verbose=verbose)
-
-                        if sibling_result and sibling_result.get('id') not in seen_ids:
-                            expanded.append(sibling_result)
-                            seen_ids.add(sibling_result.get('id'))
-                            found_count += 1
-
-                    if verbose:
-                        print(f"  Found {found_count} sibling(s) in Qdrant")
+            # Commented out: Original sibling file expansion behavior
+            # This was used before chunking to expand with related files from the same group
+            # With chunking, we focus on neighboring chunks instead for better precision
+            #
+            # else:
+            #     # Original behavior: expand with sibling files
+            #     sibling_paths = payload.get('sibling_files', [])
+            #
+            #     if sibling_paths:
+            #         if verbose:
+            #             print(f"\nFinding siblings for: {payload.get('file_path', 'N/A').split('/')[-1]}")
+            #             print(f"  Looking for {len(sibling_paths)} sibling file(s)...")
+            #
+            #         found_count = 0
+            #         for sibling_path in sibling_paths:
+            #             # Try to find this sibling in our original results
+            #             sibling_result = self._find_document_by_path(sibling_path, verbose=verbose)
+            #
+            #             if sibling_result and sibling_result.get('id') not in seen_ids:
+            #                 expanded.append(sibling_result)
+            #                 seen_ids.add(sibling_result.get('id'))
+            #                 found_count += 1
+            #
+            #         if verbose:
+            #             print(f"  Found {found_count} sibling(s) in Qdrant")
 
         return expanded
 

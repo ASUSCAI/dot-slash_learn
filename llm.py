@@ -41,18 +41,25 @@ class LLMQuerySystem:
             collection_name=collection_name
         )
 
-        # Load LLM
-        print('\n' + '='*80)
-        print('LOADING LLM: Qwen3-VL-4B-Instruct')
-        print('='*80)
-        self.processor = AutoProcessor.from_pretrained('Qwen/Qwen3-VL-4B-Instruct')
-        self.llm = AutoModelForImageTextToText.from_pretrained(
-            'Qwen/Qwen3-VL-4B-Instruct',
-            dtype=torch.float16 if self.device.type == 'cuda' else torch.float32,
-            device_map='auto'
-        )
-        self.llm.eval()
-        print(f'LLM loaded successfully\n')
+        # Don't load LLM yet - we'll lazy load it after RAG to save VRAM
+        self.llm = None
+        self.processor = None
+        print('\nLLM will be loaded after RAG completes (lazy loading to save VRAM)\n')
+
+    def _load_llm(self):
+        """Lazy load the LLM model when needed"""
+        if self.llm is None:
+            print('\n' + '='*80)
+            print('LOADING LLM: Qwen3-VL-4B-Instruct')
+            print('='*80)
+            self.processor = AutoProcessor.from_pretrained('Qwen/Qwen3-VL-4B-Instruct')
+            self.llm = AutoModelForImageTextToText.from_pretrained(
+                'Qwen/Qwen3-VL-4B-Instruct',
+                dtype=torch.float16 if self.device.type == 'cuda' else torch.float32,
+                device_map='auto'
+            )
+            self.llm.eval()
+            print(f'LLM loaded successfully\n')
 
     def format_context(self, documents: List[Tuple[Dict[str, Any], float]]) -> str:
         """
@@ -134,6 +141,9 @@ class LLMQuerySystem:
             print('RETRIEVED DOCUMENTS (Context for LLM)')
             print('='*80)
             print(context)
+
+        # Now load LLM after RAG models are offloaded
+        self._load_llm()
 
         # Build prompt
         prompt = f"""Based on the following course materials, please answer the question. Use the information from the documents to provide a comprehensive and accurate answer.

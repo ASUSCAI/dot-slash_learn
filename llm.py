@@ -142,7 +142,7 @@ class LLMQuerySystem:
             query=user_query,
             top_k=3,
             use_reranker=True,
-            rerank_candidates=10,
+            rerank_candidates=30,  # Increased for chunk-level retrieval
             verbose=True
         )
 

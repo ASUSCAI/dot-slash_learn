@@ -25,6 +25,7 @@ import os
 import json
 import torch
 import PyPDF2
+import re
 from pathlib import Path
 from typing import List, Dict, Any
 from qdrant_client import QdrantClient
@@ -34,9 +35,18 @@ from qdrant_client.models import Distance, VectorParams, PointStruct
 
 class CourseEmbedder:
 
-    def __init__(self, qdrant_host: str = 'localhost', qdrant_port: int = 6333, collection_name: str = 'course_materials', exclude_extensions: List[str] = None, exclude_filenames: List[str] = None):
+    def __init__(self, qdrant_host: str = 'localhost', qdrant_port: int = 6333, collection_name: str = 'course_materials', exclude_extensions: List[str] = None, exclude_filenames: List[str] = None, chunk_size: int = 500, chunk_overlap: int = 100):
+        """
+        Initialize CourseEmbedder with semantic chunking support.
+
+        Args:
+            chunk_size: Target tokens per chunk (default: 500 ~= 700-800 words)
+            chunk_overlap: Token overlap between chunks (default: 100 ~= 140 words)
+        """
         self.exclude_extensions = exclude_extensions or []
         self.exclude_filenames = exclude_filenames or []
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f'Using device: {self.device}')
@@ -93,6 +103,59 @@ class CourseEmbedder:
                 print(f'Error reading file {file_path}: {e}')
                 return ''
 
+    def chunk_text(self, text: str) -> List[str]:
+        """
+        Split text into overlapping chunks using sentence boundaries.
+
+        Strategy:
+        1. Split by sentences (using periods, exclamation marks, question marks)
+        2. Group sentences into chunks targeting self.chunk_size tokens
+        3. Overlap chunks by self.chunk_overlap tokens for context continuity
+
+        Returns:
+            List of text chunks
+        """
+        if not text.strip():
+            return []
+
+        # Split into sentences (simple but effective regex)
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+
+        chunks = []
+        current_chunk = []
+        current_tokens = 0
+
+        for sentence in sentences:
+            # Tokenize to count tokens
+            sentence_tokens = len(self.tokenizer.encode(sentence, add_special_tokens=False))
+
+            # If adding this sentence exceeds chunk_size, finalize current chunk
+            if current_tokens + sentence_tokens > self.chunk_size and current_chunk:
+                chunks.append(' '.join(current_chunk))
+
+                # Start new chunk with overlap
+                # Keep sentences from the end totaling ~chunk_overlap tokens
+                overlap_chunk = []
+                overlap_tokens = 0
+                for sent in reversed(current_chunk):
+                    sent_tokens = len(self.tokenizer.encode(sent, add_special_tokens=False))
+                    if overlap_tokens + sent_tokens > self.chunk_overlap:
+                        break
+                    overlap_chunk.insert(0, sent)
+                    overlap_tokens += sent_tokens
+
+                current_chunk = overlap_chunk
+                current_tokens = overlap_tokens
+
+            current_chunk.append(sentence)
+            current_tokens += sentence_tokens
+
+        # Add the last chunk
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+
+        return chunks
+
     def embed_text(self, text: str) -> List[float]:
         if not text.strip():
             print('Warning: Empty text provided for embedding')
@@ -147,36 +210,48 @@ class CourseEmbedder:
 
                 print(f'    Content length: {len(text_content)} characters')
 
-                vector = self.embed_text(text_content)
+                # Chunk the document
+                chunks = self.chunk_text(text_content)
+                print(f'    Split into {len(chunks)} chunks')
 
-                payload = {
-                    'file_path': file_info['path'],
-                    'file_type': file_info['type'],
-                    'description': file_info.get('description', ''),
+                # Create a point for each chunk
+                for chunk_idx, chunk in enumerate(chunks):
+                    vector = self.embed_text(chunk)
 
-                    'group_id': group_id,
-                    'group_type': group_data['group_type'],
-                    'course': group_data['course'],
+                    payload = {
+                        'file_path': file_info['path'],
+                        'file_type': file_info['type'],
+                        'description': file_info.get('description', ''),
 
-                    'sibling_files': sibling_paths,
-                    'sibling_count': len(sibling_paths),
+                        'group_id': group_id,
+                        'group_type': group_data['group_type'],
+                        'course': group_data['course'],
 
-                    # preview for debugging purposes
-                    'content_preview': text_content[:300],
-                    'content_length': len(text_content)
-                }
+                        'sibling_files': sibling_paths,
+                        'sibling_count': len(sibling_paths),
 
-                if group_data['group_type'] == 'lecture':
-                    payload['lecture_number'] = group_data.get('lecture_number')
-                    payload['title'] = group_data.get('title', '')
-                elif group_data['group_type'] == 'assignment':
-                    payload['assignment_number'] = group_data.get('assignment_number')
-                    payload['title'] = group_data.get('title', '')
+                        # Chunk metadata
+                        'chunk_index': chunk_idx,
+                        'total_chunks': len(chunks),
+                        'is_chunked': True,
 
-                point = PointStruct(id = point_id, vector = vector, payload = payload)
+                        # Store full chunk content for context
+                        'full_content': chunk,
+                        'content_preview': chunk[:300],
+                        'content_length': len(chunk)
+                    }
 
-                points.append(point)
-                point_id += 1
+                    if group_data['group_type'] == 'lecture':
+                        payload['lecture_number'] = group_data.get('lecture_number')
+                        payload['title'] = group_data.get('title', '')
+                    elif group_data['group_type'] == 'assignment':
+                        payload['assignment_number'] = group_data.get('assignment_number')
+                        payload['title'] = group_data.get('title', '')
+
+                    point = PointStruct(id = point_id, vector = vector, payload = payload)
+
+                    points.append(point)
+                    point_id += 1
 
         if points:
             print(f'\n Uploading {len(points)} points to Qdrant...')

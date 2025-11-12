@@ -76,9 +76,12 @@ class QueryEngine:
 
         return embedding.cpu().numpy().tolist()
 
-    def search(self, query: str, top_k: int = 3, use_reranker: bool = False, rerank_candidates: int = 10, verbose: bool = True):
+    def search(self, query: str, top_k: int = 3, use_reranker: bool = False, rerank_candidates: int = 30, verbose: bool = True):
         """
         Search for relevant documents with two-stage reranking.
+
+        With chunking enabled, documents are split into chunks, so we retrieve
+        more candidates (default: 30) to ensure good coverage.
 
         Returns:
             List of tuples: (result_dict, rerank_score)
@@ -159,7 +162,10 @@ class QueryEngine:
 
     def _expand_with_siblings(self, top_results, all_results, verbose: bool = True):
         """
-        Expand top results with their sibling files from Qdrant.
+        Expand top results with their sibling files/chunks from Qdrant.
+
+        For chunked documents: Expands with neighboring chunks from same file
+        For non-chunked documents: Expands with sibling files from same group
 
         Args:
             top_results: List of (result, score) tuples from first rerank
@@ -170,43 +176,109 @@ class QueryEngine:
             List of result dicts (without scores) ready for reranking
         """
         expanded = []
-        seen_paths = set()
+        seen_ids = set()
 
         # First, add the top 3 results themselves
         for result, score in top_results:
-            file_path = result['payload'].get('file_path')
-            if file_path and file_path not in seen_paths:
+            result_id = result.get('id')
+            if result_id and result_id not in seen_ids:
                 expanded.append(result)
-                seen_paths.add(file_path)
+                seen_ids.add(result_id)
 
-        # Then, try to find siblings in Qdrant
+        # Then, expand based on whether documents are chunked
         for result, score in top_results:
             payload = result['payload']
-            sibling_paths = payload.get('sibling_files', [])
 
-            if sibling_paths:
-                if verbose:
-                    print(f"\nFinding siblings for: {payload.get('file_path', 'N/A').split('/')[-1]}")
-                    print(f"  Looking for {len(sibling_paths)} sibling file(s)...")
+            # Check if this is a chunk
+            is_chunked = payload.get('is_chunked', False)
 
-                found_count = 0
-                for sibling_path in sibling_paths:
-                    # Skip if we've already added this file
-                    if sibling_path in seen_paths:
-                        continue
-
-                    # Try to find this sibling in our original results
-                    sibling_result = self._find_document_by_path(sibling_path, verbose=verbose)
-
-                    if sibling_result:
-                        expanded.append(sibling_result)
-                        seen_paths.add(sibling_path)
-                        found_count += 1
+            if is_chunked:
+                # Expand with neighboring chunks from same document
+                file_path = payload.get('file_path')
+                chunk_index = payload.get('chunk_index', 0)
+                total_chunks = payload.get('total_chunks', 1)
 
                 if verbose:
-                    print(f"  Found {found_count} sibling(s) in Qdrant")
+                    print(f"\nExpanding chunk {chunk_index+1}/{total_chunks} from: {file_path.split('/')[-1]}")
+
+                # Find prev and next chunks
+                for offset in [-1, 1]:  # Previous and next chunk
+                    neighbor_idx = chunk_index + offset
+                    if 0 <= neighbor_idx < total_chunks:
+                        neighbor = self._find_chunk_by_index(file_path, neighbor_idx, verbose=verbose)
+                        if neighbor and neighbor.get('id') not in seen_ids:
+                            expanded.append(neighbor)
+                            seen_ids.add(neighbor.get('id'))
+                            if verbose:
+                                print(f"  ✓ Added chunk {neighbor_idx+1}/{total_chunks}")
+
+            else:
+                # Original behavior: expand with sibling files
+                sibling_paths = payload.get('sibling_files', [])
+
+                if sibling_paths:
+                    if verbose:
+                        print(f"\nFinding siblings for: {payload.get('file_path', 'N/A').split('/')[-1]}")
+                        print(f"  Looking for {len(sibling_paths)} sibling file(s)...")
+
+                    found_count = 0
+                    for sibling_path in sibling_paths:
+                        # Try to find this sibling in our original results
+                        sibling_result = self._find_document_by_path(sibling_path, verbose=verbose)
+
+                        if sibling_result and sibling_result.get('id') not in seen_ids:
+                            expanded.append(sibling_result)
+                            seen_ids.add(sibling_result.get('id'))
+                            found_count += 1
+
+                    if verbose:
+                        print(f"  Found {found_count} sibling(s) in Qdrant")
 
         return expanded
+
+    def _find_chunk_by_index(self, file_path: str, chunk_index: int, verbose: bool = True):
+        """
+        Find a specific chunk from a document by its file path and chunk index.
+
+        Args:
+            file_path: The file path of the document
+            chunk_index: The index of the chunk to find
+            verbose: Whether to print messages
+
+        Returns:
+            Result dict if found, None otherwise
+        """
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+            results = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="file_path",
+                            match=MatchValue(value=file_path)
+                        ),
+                        FieldCondition(
+                            key="chunk_index",
+                            match=MatchValue(value=chunk_index)
+                        )
+                    ]
+                ),
+                limit=1
+            )
+
+            if results[0]:  # results is a tuple (points, next_page_offset)
+                hit = results[0][0]  # Get first point
+                return {
+                    'payload': hit.payload,
+                    'score': 0.0,  # No score from scroll
+                    'id': hit.id
+                }
+        except Exception as e:
+            if verbose:
+                print(f"  Warning: Could not find chunk {chunk_index}: {e}")
+            return None
 
     def _find_document_by_path(self, file_path, verbose: bool = True):
         """

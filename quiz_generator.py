@@ -18,7 +18,7 @@ Usage:
 import json
 import torch
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable, Awaitable, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
@@ -47,7 +47,8 @@ class QuizGenerator:
         num_easy: int = 0,
         num_medium: int = 0,
         num_hard: int = 0,
-        question_style: str = "concrete"
+        question_style: str = "concrete",
+        question_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Generate quiz questions with explanations at different difficulty levels.
@@ -87,9 +88,9 @@ class QuizGenerator:
         print('='*80)
         self._offload_embedding_model()
 
-        # Phase 1: Retrieve chunks and generate questions
+        # Phase 1: Retrieve chunks and lazily generate questions
         print('\n' + '='*80)
-        print('PHASE 1: Retrieving chunks and generating questions')
+        print('PHASE 1: Retrieving chunks and lazily generating questions')
         print('='*80)
 
         chunks = self._retrieve_chunks_by_skill(skill)
@@ -99,6 +100,9 @@ class QuizGenerator:
             return []
 
         print(f'\nRetrieved {len(chunks)} chunks for skill "{skill}"')
+
+        # Prepare shared context once
+        context = self._format_chunks_for_context(chunks, skill)
 
         # Calculate total MCQ/T-F split once for all questions
         # Then distribute across difficulty levels
@@ -145,37 +149,63 @@ class QuizGenerator:
             diff_name, diff_total, diff_mcq, diff_tf = difficulty_distribution[largest_idx]
             difficulty_distribution[largest_idx] = (diff_name, diff_total, diff_mcq + diff, diff_tf - diff)
 
-        # Generate questions for each difficulty level with specific MCQ/T-F counts
-        all_questions_data = []
+        # Generate questions lazily and attach explanations before moving on
+        final_questions: List[Dict[str, Any]] = []
+        question_counter = 0
+
+        async def _handle_question(raw_question: Optional[Dict[str, Any]]) -> None:
+            nonlocal question_counter
+            if not raw_question:
+                return
+
+            question_counter += 1
+            enriched = await self._build_question_with_explanations(
+                question_data=raw_question,
+                context=context,
+                skill=skill,
+                question_style=question_style,
+                question_number=question_counter
+            )
+
+            if question_callback is not None:
+                await question_callback(enriched)
+
+            final_questions.append(enriched)
 
         for difficulty, total, num_mcq_diff, num_tf_diff in difficulty_distribution:
-            questions = self._generate_questions_with_llm(
-                chunks, learning_objective, skill,
-                num_mcq=num_mcq_diff,
-                num_tf=num_tf_diff,
-                difficulty=difficulty
-            )
-            all_questions_data.extend(questions)
+            if num_mcq_diff > 0:
+                print(f'\nGenerating {num_mcq_diff} MCQ questions at {difficulty.upper()} difficulty')
+            for idx in range(num_mcq_diff):
+                print(f'  -> Generating MCQ {idx + 1} of {num_mcq_diff} ({difficulty})')
+                raw_question = self._generate_single_question_with_llm(
+                    context=context,
+                    learning_objective=learning_objective,
+                    skill=skill,
+                    difficulty=difficulty,
+                    question_type='mcq'
+                )
+                await _handle_question(raw_question)
 
-        if not all_questions_data:
-            print('\nWarning: Failed to generate questions')
-            # Restore embedding model before returning
+            if num_tf_diff > 0:
+                print(f'\nGenerating {num_tf_diff} True/False questions at {difficulty.upper()} difficulty')
+            for idx in range(num_tf_diff):
+                print(f'  -> Generating True/False {idx + 1} of {num_tf_diff} ({difficulty})')
+                raw_question = self._generate_single_question_with_llm(
+                    context=context,
+                    learning_objective=learning_objective,
+                    skill=skill,
+                    difficulty=difficulty,
+                    question_type='true_false'
+                )
+                await _handle_question(raw_question)
+
+        if not final_questions:
+            print('\nWarning: Failed to generate any complete questions')
             self._restore_embedding_model()
             return []
 
-        print(f'\nGenerated {len(all_questions_data)} questions total')
-
-        # Phase 2: Generate explanations in parallel
         print('\n' + '='*80)
-        print('PHASE 2: Generating explanations for all options (parallel)')
-        print('='*80)
-
-        questions_with_explanations = await self._generate_all_explanations(
-            all_questions_data, chunks, skill, question_style
-        )
-
-        print('\n' + '='*80)
-        print(f'QUIZ GENERATION COMPLETE: {len(questions_with_explanations)} questions')
+        print(f'QUIZ GENERATION COMPLETE: {len(final_questions)} questions (lazy loading)')
         print('='*80)
 
         # VRAM CLEANUP: Offload LLM and restore embedding model
@@ -184,7 +214,7 @@ class QuizGenerator:
         print('='*80)
         self._cleanup_vram()
 
-        return questions_with_explanations
+        return final_questions
 
     def _retrieve_chunks_by_skill(self, skill: str) -> List[Dict[str, Any]]:
         """
@@ -260,44 +290,140 @@ class QuizGenerator:
 
         return context
 
-    def _generate_questions_with_llm(
+    async def _build_question_with_explanations(
         self,
-        chunks: List[Dict[str, Any]],
+        *,
+        question_data: Dict[str, Any],
+        context: str,
+        skill: str,
+        question_style: str,
+        question_number: int
+    ) -> Dict[str, Any]:
+        """Attach explanations to a single question before generating the next."""
+
+        tasks = []
+
+        for option in question_data['options']:
+            option_id = option['id']
+            is_correct = (option_id == question_data['correct_answer'])
+            tasks.append(
+                self._generate_single_explanation(
+                    question=question_data['question'],
+                    option_id=option_id,
+                    option_text=option['text'],
+                    is_correct=is_correct,
+                    context=context,
+                    skill=skill,
+                    question_style=question_style
+                )
+            )
+
+        explanations = await asyncio.gather(*tasks)
+
+        options_with_explanations = []
+        for option, explanation in zip(question_data['options'], explanations):
+            options_with_explanations.append({
+                'id': option['id'],
+                'text': option['text'],
+                'explanation': explanation,
+                'is_correct': option['id'] == question_data['correct_answer']
+            })
+
+        return {
+            'id': f'q{question_number}',
+            'type': question_data['type'],
+            'question': question_data['question'],
+            'options': options_with_explanations,
+            'skill': question_data.get('skill', skill),
+            'difficulty': question_data.get('difficulty', 'medium')
+        }
+
+    async def iter_quiz_questions(
+        self,
         learning_objective: str,
         skill: str,
-        num_mcq: int,
-        num_tf: int,
-        difficulty: str = 'medium'
-    ) -> List[Dict[str, Any]]:
-        """
-        Generate questions using LLM (Phase 1).
+        num_easy: int = 0,
+        num_medium: int = 0,
+        num_hard: int = 0,
+        question_style: str = "concrete"
+    ):
+        """Yield quiz questions one at a time as they are generated."""
 
-        Args:
-            chunks: Retrieved chunks
-            learning_objective: Learning objective
-            skill: Target skill
-            num_mcq: Number of MCQ questions to generate
-            num_tf: Number of True/False questions to generate
-            difficulty: Difficulty level ('easy', 'medium', or 'hard')
+        event_queue: "asyncio.Queue[Tuple[str, Optional[Dict[str, Any]]]]" = asyncio.Queue()
 
-        Returns:
-            List of question data (without explanations yet)
-        """
-        num_questions = num_mcq + num_tf
+        async def _callback(question: Dict[str, Any]) -> None:
+            await event_queue.put(("question", question))
 
-        # Define difficulty guidance for LLM
+        async def _run_generation() -> None:
+            try:
+                await self.generate_quiz(
+                    learning_objective=learning_objective,
+                    skill=skill,
+                    num_easy=num_easy,
+                    num_medium=num_medium,
+                    num_hard=num_hard,
+                    question_style=question_style,
+                    question_callback=_callback
+                )
+                await event_queue.put(("complete", None))
+            except Exception as exc:
+                await event_queue.put(("error", exc))
+
+        runner_task = asyncio.create_task(_run_generation())
+
+        try:
+            while True:
+                event_type, payload = await event_queue.get()
+                if event_type == "question":
+                    if payload is not None:
+                        yield payload
+                elif event_type == "complete":
+                    break
+                elif event_type == "error":
+                    if isinstance(payload, Exception):
+                        raise payload
+                    raise RuntimeError("Quiz generation failed unexpectedly")
+        finally:
+            await asyncio.gather(runner_task, return_exceptions=True)
+
+    def _generate_single_question_with_llm(
+        self,
+        *,
+        context: str,
+        learning_objective: str,
+        skill: str,
+        difficulty: str,
+        question_type: str
+    ) -> Optional[Dict[str, Any]]:
+        """Generate a single quiz question via LLM to reduce latency spikes."""
+
         difficulty_guides = {
             'easy': 'Easy questions should test basic recall and understanding of fundamental concepts. Use straightforward language and test direct knowledge from the materials.',
             'medium': 'Medium questions should require applying concepts and making connections. Test understanding beyond simple recall.',
             'hard': 'Hard questions should involve complex analysis, synthesis of multiple concepts, or subtle edge cases. These should challenge deep understanding.'
         }
 
-        print(f'\nGenerating {num_mcq} MCQ and {num_tf} True/False questions at {difficulty.upper()} difficulty')
+        question_type = question_type.lower()
 
-        # Combine chunks into context
-        context = self._format_chunks_for_context(chunks, skill)
+        if question_type == 'mcq':
+            type_instructions = (
+                'Generate exactly one multiple-choice question with four answer options labeled "A", "B", "C", and "D".'
+            )
+            format_instructions = (
+                '[{"id": "A", "text": "Option text"}, {"id": "B", "text": "Option text"}, {"id": "C", "text": "Option text"}, {"id": "D", "text": "Option text"}]'
+            )
+            type_value = 'mcq'
+        elif question_type == 'true_false':
+            type_instructions = 'Generate exactly one true/false question with options for "true" and "false".'
+            format_instructions = (
+                '[{"id": "true", "text": "True"}, {"id": "false", "text": "False"}]'
+            )
+            type_value = 'true_false'
+        else:
+            print(f'  Warning: Unsupported question type "{question_type}"')
+            return None
 
-        prompt = f"""Based on the course materials below, generate {num_questions} quiz questions to test understanding of "{skill}".
+        prompt = f"""Based on the course materials below, generate one quiz question to test understanding of "{skill}".
 
 Learning Objective: {learning_objective}
 Target Skill: {skill}
@@ -308,138 +434,66 @@ Difficulty Level: {difficulty.upper()}
 Course Materials:
 {context}
 
-Generate exactly:
-- {num_mcq} Multiple Choice Questions (4 options each: A, B, C, D)
-- {num_tf} True/False Questions
+{type_instructions}
 
-Requirements for each question:
-1. Focus on testing understanding of "{skill}"
-2. Base questions directly on the course materials provided
-3. Make questions clear and unambiguous
-4. Ensure only one correct answer per question
-5. Make incorrect options plausible but clearly wrong
-6. **IMPORTANT**: Adjust question complexity to match the {difficulty.upper()} difficulty level
-7. **CRITICAL**: Keep answer options SHORT and CONCISE (5-10 words maximum per option)
-   - Use brief, direct phrases
-   - Avoid lengthy explanations in options
-   - Get straight to the point
+Requirements:
+1. Focus on testing understanding of "{skill}".
+2. Base the question directly on the course materials provided.
+3. Make the question clear and unambiguous.
+4. Ensure only one correct answer.
+5. Make incorrect options plausible but clearly wrong.
+6. Keep answer options short (5-10 words each).
+7. Do not include any additional commentary or explanation.
 
-Return ONLY a valid JSON array in this exact format (no additional text):
-[
-  {{
-    "type": "mcq",
-    "question": "What is the primary purpose of dynamic programming?",
-    "options": [
-      {{"id": "A", "text": "Random problem solving"}},
-      {{"id": "B", "text": "Optimize recursion with memoization"}},
-      {{"id": "C", "text": "Obfuscate code"}},
-      {{"id": "D", "text": "Eliminate all loops"}}
-    ],
-    "correct_answer": "B"
-  }},
-  {{
-    "type": "true_false",
-    "question": "Dynamic programming requires memoization in all cases.",
-    "options": [
-      {{"id": "true", "text": "True"}},
-      {{"id": "false", "text": "False"}}
-    ],
-    "correct_answer": "false"
-  }}
-]
+Return ONLY a valid JSON object in this exact format (no additional text):
+{{
+  "type": "{type_value}",
+  "question": "Question text",
+  "options": {format_instructions},
+  "correct_answer": "ID of correct option"
+}}
 
-JSON Array:"""
+JSON Object:"""
 
-        # Load LLM and generate
-        self.embedder._load_llm()
+        print('    Calling LLM for single question...')
+        response = self._call_llm_sync(prompt, max_tokens=600)
 
-        print('\nCalling LLM to generate questions...')
-        response = self._call_llm_sync(prompt, max_tokens=1500)
-
-        # Parse JSON response
         try:
-            # Extract JSON array from response
             response = response.strip()
 
-            # Find JSON array in response
-            start_idx = response.find('[')
-            end_idx = response.rfind(']') + 1
+            # Attempt to locate JSON object in response
+            start_idx = response.find('{')
+            end_idx = response.rfind('}') + 1
 
-            if start_idx != -1 and end_idx > start_idx:
-                json_str = response[start_idx:end_idx]
-                questions = json.loads(json_str)
+            if start_idx == -1 or end_idx <= start_idx:
+                print('    Warning: Could not locate JSON object in LLM response')
+                print(f'    Response: {response[:400]}...')
+                return None
 
-                # Add difficulty level to each question
-                for question in questions:
-                    question['difficulty'] = difficulty
+            json_str = response[start_idx:end_idx]
+            parsed = json.loads(json_str)
 
-                print(f'\nSuccessfully parsed {len(questions)} {difficulty} questions from LLM response')
-                return questions
-            else:
-                print(f'\nWarning: Could not find JSON array in LLM response')
-                print(f'Response: {response[:500]}...')
-                return []
+            if isinstance(parsed, list):
+                if not parsed:
+                    print('    Warning: LLM returned an empty list')
+                    return None
+                parsed = parsed[0]
 
-        except json.JSONDecodeError as e:
-            print(f'\nWarning: Failed to parse JSON from LLM response: {e}')
-            print(f'Response: {response[:500]}...')
-            return []
+            if not isinstance(parsed, dict):
+                print('    Warning: Parsed JSON is not an object')
+                return None
 
-    async def _generate_all_explanations(
-        self,
-        questions_data: List[Dict[str, Any]],
-        chunks: List[Dict[str, Any]],
-        skill: str,
-        question_style: str = "concrete"
-    ) -> List[Dict[str, Any]]:
-        """
-        Generate explanations for all options in parallel (Phase 2).
+            if parsed.get('type') != type_value:
+                print('    Warning: LLM returned unexpected question type')
+                return None
 
-        Args:
-            questions_data: Questions without explanations
-            chunks: Retrieved chunks for context
-            skill: Target skill
-            question_style: Explanation style - 'concrete' or 'abstract'
+            parsed['difficulty'] = difficulty
+            return parsed
 
-        Returns:
-            Complete questions with explanations
-        """
-        context = self._format_chunks_for_context(chunks, skill)
-
-        # Create tasks for all option explanations
-        tasks = []
-        task_metadata = []  # Track which question/option each task corresponds to
-
-        for q_idx, question in enumerate(questions_data):
-            for option in question['options']:
-                is_correct = (option['id'] == question['correct_answer'])
-
-                task = self._generate_single_explanation(
-                    question=question['question'],
-                    option_id=option['id'],
-                    option_text=option['text'],
-                    is_correct=is_correct,
-                    context=context,
-                    skill=skill,
-                    question_style=question_style
-                )
-                tasks.append(task)
-                task_metadata.append({
-                    'q_idx': q_idx,
-                    'option_id': option['id']
-                })
-
-        print(f'\nGenerating {len(tasks)} explanations in parallel...')
-
-        # Run all tasks in parallel
-        explanations = await asyncio.gather(*tasks)
-
-        print(f'Generated {len(explanations)} explanations')
-
-        # Map explanations back to questions
-        return self._combine_explanations_with_questions(
-            questions_data, explanations, task_metadata
-        )
+        except json.JSONDecodeError as exc:
+            print(f'    Warning: Failed to parse JSON from LLM response: {exc}')
+            print(f'    Response: {response[:400]}...')
+            return None
 
     async def _generate_single_explanation(
         self,
@@ -488,9 +542,9 @@ Course Materials:
 Question: {question}
 Selected Answer ({option_id}): {option_text}
 
-Provide a clear, concise explanation (2-3 sentences) for why this answer is {correctness}.
-Focus on educational value - help the student understand the concept of "{skill}".
-Reference specific details from the course materials when possible.
+Provide a single crisp sentence (no more than 18 words) explaining why this answer is {correctness}.
+Focus on educational value; highlight the key idea a student must know about "{skill}".
+Reference the most relevant detail from the course materials when possible.
 
 {style_guidance}
 
@@ -543,63 +597,6 @@ Explanation:"""
         )
 
         return response.strip()
-
-    def _combine_explanations_with_questions(
-        self,
-        questions_data: List[Dict[str, Any]],
-        explanations: List[str],
-        task_metadata: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """
-        Combine generated explanations back into question structure.
-
-        Args:
-            questions_data: Questions without explanations
-            explanations: Generated explanations
-            task_metadata: Metadata mapping explanations to questions/options
-
-        Returns:
-            Complete questions with explanations
-        """
-        # Build explanation map: {q_idx: {option_id: explanation}}
-        explanation_map = {}
-        for metadata, explanation in zip(task_metadata, explanations):
-            q_idx = metadata['q_idx']
-            option_id = metadata['option_id']
-
-            if q_idx not in explanation_map:
-                explanation_map[q_idx] = {}
-
-            explanation_map[q_idx][option_id] = explanation
-
-        # Build final questions list
-        final_questions = []
-
-        for q_idx, question_data in enumerate(questions_data):
-            # Build options with explanations and correctness
-            options = []
-            for option in question_data['options']:
-                option_id = option['id']
-                explanation = explanation_map.get(q_idx, {}).get(option_id, '')
-                is_correct = (option_id == question_data['correct_answer'])
-
-                options.append({
-                    'id': option_id,
-                    'text': option['text'],
-                    'explanation': explanation,
-                    'is_correct': is_correct
-                })
-
-            final_questions.append({
-                'id': f'q{q_idx + 1}',
-                'type': question_data['type'],
-                'question': question_data['question'],
-                'options': options,
-                'skill': question_data.get('skill', ''),
-                'difficulty': question_data.get('difficulty', 'medium')
-            })
-
-        return final_questions
 
     def _offload_embedding_model(self):
         """Offload embedding model to CPU to free VRAM for LLM"""

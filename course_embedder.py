@@ -26,6 +26,7 @@ import json
 import torch
 import PyPDF2
 import re
+import threading
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -69,17 +70,10 @@ class CourseEmbedder:
 
         self.client = QdrantClient(host = qdrant_host, port = qdrant_port)
         self.collection_name = collection_name
+        self.vector_size = 2560
+        self._collection_lock = threading.Lock()
 
-        try:
-            self.client.get_collection(collection_name)
-            print(f'Collection {collection_name} already exists')
-        except Exception as e:
-            print(f'Creating collection {collection_name}...')
-            self.client.create_collection(
-                collection_name = collection_name,
-                vectors_config = VectorParams(size = 2560, distance = Distance.COSINE)
-            )
-            print(f'Collection {collection_name} created successfully')
+        self._ensure_collection_exists()
 
         # LLM components for skill extraction/classification (lazy loaded)
         self.llm = None
@@ -432,6 +426,7 @@ Classification:"""
                     point_id += 1
 
         if points:
+            self._ensure_collection_exists()
             print(f'\n Uploading {len(points)} points to Qdrant...')
             batch_size = 10
             for i in range(0, len(points), batch_size):
@@ -447,12 +442,37 @@ Classification:"""
             print('No points to upload!')
 
     def get_next_point_id(self) -> int:
+        self._ensure_collection_exists()
         try:
             collection_info = self.client.get_collection(self.collection_name)
             points_count = collection_info.points_count
             return points_count
         except:
             return 0
+
+    def _ensure_collection_exists(self) -> None:
+        """Ensure the target collection exists before performing Qdrant operations."""
+        with self._collection_lock:
+            try:
+                self.client.get_collection(self.collection_name)
+                return
+            except Exception:
+                pass
+
+            print(f'Creating collection {self.collection_name}...')
+            try:
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config=VectorParams(size=self.vector_size, distance=Distance.COSINE)
+                )
+                print(f'Collection {self.collection_name} created successfully')
+            except Exception as exc:
+                # Another worker may have created the collection after the initial check.
+                try:
+                    self.client.get_collection(self.collection_name)
+                    print(f'Collection {self.collection_name} became available')
+                except Exception:
+                    raise exc
 
     # ============================================================================
     # NEW API-based embedding methods
@@ -686,6 +706,7 @@ Classification:"""
 
         # Upload to Qdrant in batches
         if points:
+            self._ensure_collection_exists()
             print(f'\nUploading {len(points)} points to Qdrant...')
             batch_size = 10
             for i in range(0, len(points), batch_size):
@@ -719,6 +740,7 @@ Classification:"""
         group_type: Optional[str] = "module",
     ) -> List[Dict[str, Any]]:
         """Return aggregated status for embedded modules."""
+        self._ensure_collection_exists()
         module_map: Dict[str, Dict[str, Any]] = {}
         items_key = "items"
         offset = None
@@ -850,6 +872,113 @@ Classification:"""
         results.sort(key=lambda entry: entry.get("module_name") or entry["group_id"])
         return results
 
+    def list_learning_objectives(
+        self,
+        course: Optional[str] = None,
+        group_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return unique learning objectives stored in the collection."""
+        self._ensure_collection_exists()
+
+        objective_map: Dict[str, Dict[str, Any]] = {}
+        offset = None
+
+        filter_conditions = []
+        if course:
+            filter_conditions.append(
+                FieldCondition(key="course", match=MatchValue(value=course))
+            )
+        if group_type:
+            filter_conditions.append(
+                FieldCondition(key="group_type", match=MatchValue(value=group_type))
+            )
+
+        scroll_filter = Filter(must=filter_conditions) if filter_conditions else None
+
+        while True:
+            scroll_kwargs: Dict[str, Any] = {
+                "collection_name": self.collection_name,
+                "limit": 200,
+                "with_payload": True,
+                "with_vectors": False,
+            }
+            if scroll_filter is not None:
+                scroll_kwargs["scroll_filter"] = scroll_filter
+            if offset is not None:
+                scroll_kwargs["offset"] = offset
+
+            records, offset = self.client.scroll(**scroll_kwargs)
+            if not records and offset is None:
+                break
+
+            for record in records or []:
+                payload = record.payload or {}
+                raw_objective = payload.get("learning_objective")
+                if raw_objective is None:
+                    continue
+
+                title = str(raw_objective).strip()
+                if not title:
+                    continue
+
+                normalized = title.casefold()
+                entry = objective_map.setdefault(
+                    normalized,
+                    {
+                        "title": title,
+                        "occurrence_count": 0,
+                        "courses": set(),
+                        "group_types": set(),
+                        "sample_module_names": set(),
+                        "last_ingested_at": None,
+                    },
+                )
+
+                entry["occurrence_count"] += 1
+
+                course_value = payload.get("course")
+                if course_value:
+                    entry["courses"].add(str(course_value))
+
+                group_value = payload.get("group_type")
+                if group_value:
+                    entry["group_types"].add(str(group_value))
+
+                module_name = payload.get("module_name")
+                if isinstance(module_name, str):
+                    stripped_module = module_name.strip()
+                    if stripped_module:
+                        entry["sample_module_names"].add(stripped_module)
+
+                ingested_at = payload.get("ingested_at")
+                if ingested_at is not None:
+                    ingested_str = str(ingested_at)
+                    current_best = entry["last_ingested_at"]
+                    if current_best is None or ingested_str > current_best:
+                        entry["last_ingested_at"] = ingested_str
+
+            if offset is None:
+                break
+
+        results: List[Dict[str, Any]] = []
+        for objective_entry in objective_map.values():
+            sample_modules = sorted(objective_entry["sample_module_names"])
+            if len(sample_modules) > 10:
+                sample_modules = sample_modules[:10]
+            results.append(
+                {
+                    "title": objective_entry["title"],
+                    "occurrence_count": objective_entry["occurrence_count"],
+                    "courses": sorted(objective_entry["courses"]),
+                    "group_types": sorted(objective_entry["group_types"]),
+                    "sample_module_names": sample_modules,
+                    "last_ingested_at": objective_entry["last_ingested_at"],
+                }
+            )
+
+        results.sort(key=lambda entry: entry["title"].casefold())
+        return results
+
     def delete_file(self, file_path: str) -> Dict[str, Any]:
         """
         Delete all chunks associated with a specific file from the collection.
@@ -860,6 +989,7 @@ Classification:"""
         Returns:
             Dict with success status and number of chunks deleted
         """
+        self._ensure_collection_exists()
         try:
             # Search for all points with matching file_path
             search_result = self.client.scroll(

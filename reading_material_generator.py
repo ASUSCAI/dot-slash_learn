@@ -196,82 +196,63 @@ class ReadingMaterialGenerator:
         """
         # Define mastery-level specific guidance
         if mastery_level.lower() == "beginner":
-            mastery_guidance = """BEGINNER LEVEL - Simple and Accessible:
+            mastery_guidance = """BEGINNER LEVEL - Simple and Accessible
 
 **Language Requirements:**
-- Use simple, clear language that anyone can understand
-- AVOID technical jargon, idioms, and complex terminology
-- When technical terms are unavoidable, provide inline definitions using this format:
-  **term** (*definition in simple words*)
-  Example: "A **variable** (*a named storage location for data*) is like a labeled box"
-- Break down complex ideas into small, digestible steps
-- Use analogies and real-world comparisons to explain concepts
+- Use plain, common words and short sentences.
+- Introduce every technical term with the format **term** (*clear definition*).
+- Avoid idioms; if one appears in the source, explain it inline.
 
 **Structure and Content:**
-- Start with the absolute basics - assume no prior knowledge
-- Include MANY practical examples with detailed explanations
-- Provide step-by-step walkthroughs for any processes
-- Use numbered lists for sequential steps
-- Include "What this means" or "Why this matters" sections
-- Add plenty of code examples with line-by-line explanations
+- Assume the reader has no prior knowledge.
+- Provide frequent, concrete examples drawn from the materials.
+- Include numbered, step-by-step instructions where the source describes a process.
+- Highlight "Why it matters" and "Common pitfalls" sections using headings.
 
 **Tone:**
-- Friendly, encouraging, and conversational
-- Patient and thorough - don't skip "obvious" details
-- Use "you" to address the reader directly"""
+- Friendly, encouraging, direct, and second-person where appropriate ("You can...").
+- Keep paragraphs short and focused on one idea."""
 
         elif mastery_level.lower() == "intermediate":
-            mastery_guidance = """INTERMEDIATE LEVEL - Technical with Accessibility:
+            mastery_guidance = """INTERMEDIATE LEVEL - Technical with Accessibility
 
 **Language Requirements:**
-- Balance technical accuracy with clarity
-- Use technical terminology but explain it when first introduced using:
-  **term** (*brief technical definition*)
-- Assume basic familiarity but don't assume expertise
-- You can use some industry terms, but clarify specialized concepts
+- Balance precise terminology with quick reminders using **term** (*brief definition*).
+- Maintain active voice and concrete verbs.
+- Keep sentences lean; remove fillers and nominalizations.
 
 **Structure and Content:**
-- Build on foundational knowledge - quick review of basics is okay
-- Mix theory with practical examples
-- Include both "how" and "why" explanations
-- Show common patterns and best practices
-- Include edge cases and gotchas
-- Compare different approaches where relevant
-- Moderate amount of code examples with focused explanations
+- Connect concepts to previously learned fundamentals before extending them.
+- Combine theory and application: clarify "How it works" and "Why it matters".
+- Call out patterns, comparisons, and edge cases using bullet lists.
+- Provide focused code or data examples only when they support the explanation.
 
 **Tone:**
-- Professional but approachable
-- Assume the reader is motivated to learn deeper concepts
-- Bridge the gap between beginner understanding and advanced expertise"""
+- Professional yet approachable.
+- Emphasize how each detail helps the practitioner deepen skill confidence."""
 
         else:  # advanced
-            mastery_guidance = """ADVANCED LEVEL - Full Technical Rigor:
+            mastery_guidance = """ADVANCED LEVEL - Expert Depth with Clarity
 
 **Language Requirements:**
-- Use precise technical terminology throughout
-- Industry-standard language and formal definitions
-- Assume familiarity with related concepts
-- No need for basic explanations or inline definitions
-- Can use idioms, design patterns, and advanced concepts freely
+- Use exact technical terms while keeping sentences direct.
+- When a niche concept appears for the first time, pair it with a concise parenthetical reminder.
+- Avoid rhetorical questions and idioms; state implications plainly.
 
 **Structure and Content:**
-- Focus on deep technical understanding and nuances
-- Emphasize theoretical foundations and formal principles
-- Discuss performance implications, trade-offs, and optimization
-- Cover edge cases, limitations, and advanced use cases
-- Reference related concepts and interconnections
-- Include complex examples that demonstrate mastery
-- Discuss real-world applications in production systems
+- Focus on theoretical nuance, trade-offs, and performance considerations.
+- Organize dense information into short subsections and lists.
+- Discuss real-world applications, limitations, and advanced techniques drawn from the materials.
+- Highlight decision criteria or comparison tables when helpful.
 
 **Tone:**
-- Professional, academic, and authoritative
-- Assume reader has strong foundation and wants expert-level insight
-- Dense, information-rich content - efficiency over hand-holding"""
+- Authoritative and efficient, prioritizing actionable insight.
+- Assume strong background knowledge but still signal why each detail matters."""
 
         # Combine chunks into context
         context = self._format_chunks_for_context(chunks, skill)
 
-        prompt = f"""Based on the course materials below, create comprehensive reading material about "{skill}" in markdown format.
+        prompt = f"""Based on the course materials below, create concise, learner-friendly reading material about "{skill}" in markdown format.
 
 Learning Objective: {learning_objective}
 Target Skill: {skill}
@@ -282,55 +263,56 @@ Mastery Level: {mastery_level.upper()}
 Course Materials:
 {context}
 
-Create well-structured educational reading material following the mastery level guidelines above with these requirements:
+Follow these non-negotiable writing rules:
 
-1. **Structure**: Use proper markdown formatting with clear sections:
-   - Start with a main heading (# {skill})
-   - Use subheadings (##, ###) for major topics and subtopics
-   - BEGINNER: More sections with smaller chunks (Introduction, What is..., Why it matters, Basic Examples, Step-by-Step Guide, Common Mistakes, Summary)
-   - INTERMEDIATE: Balanced sections (Overview, Core Concepts, Practical Applications, Best Practices, Common Patterns, Summary)
-   - ADVANCED: Dense sections (Introduction, Theoretical Foundation, Implementation Details, Advanced Techniques, Trade-offs and Optimization, Conclusion)
+1. **Overall structure and organization**
+    - Keep the total length between 500 and 900 words regardless of mastery level.
+    - Start with a level-one heading `# {skill}`.
+    - Immediately add an **advance organizer** titled "## You will learn" with exactly 2-3 bullet points previewing the key takeaways.
+    - Use short sections with descriptive micro-headings such as "## What it covers", "## Why it matters", "## How it works", "## Try it step-by-step", "## Common pitfalls", and "## What changed next" when relevant.
+    - End with a final section titled "## Key takeaway" containing one plain-language sentence summarizing the most important point.
 
-2. **Content Depth**:
-   - Base content directly on the course materials provided
-   - BEGINNER: Start from absolute basics, many examples, step-by-step walkthroughs
-   - INTERMEDIATE: Build on fundamentals, mix of theory and practice, include patterns and edge cases
-   - ADVANCED: Deep technical detail, performance considerations, production concerns, advanced use cases
-   - Use bullet points and numbered lists where appropriate
-   - Include code blocks with proper syntax highlighting when showing code
+2. **Plain language pass**
+    - Use active voice and subject-verb-object order.
+    - Prefer concrete verbs instead of nominalizations (write "explain" not "offer an explanation").
+    - Replace idioms or metaphors with direct wording, or explain them inline (for example, "spread quickly (people often say 'like wildfire' to mean very fast)").
+    - Keep sentences short; avoid center-embedded clauses and rhetorical questions.
+    - Do not use the em dash character (Unicode U+2014); rely on commas, parentheses, or separate sentences instead.
+    - Never include quizzes, comprehension questions, or prompts that ask the reader anything.
 
-3. **Terminology Handling**:
-   - BEGINNER: Use **bold term** (*simple definition in italics*) format for ALL technical terms
-   - INTERMEDIATE: Use **bold term** (*technical definition*) for specialized concepts only
-   - ADVANCED: Use technical terms freely without inline definitions
+3. **Chunking and signaling**
+    - Break paragraphs into compact chunks (3-4 sentences maximum).
+    - Use bullet or numbered lists for sequences, comparisons, or steps.
+    - Provide clear transitions that explain why each section matters before diving into detail.
 
-4. **Markdown Elements**:
-   - Headers: #, ##, ###
-   - Lists: -, *, numbered lists
-   - Code blocks: ```language ... ```
-   - Inline code: `code`
-   - Bold: **text**
-   - Italic: *text*
-   - Blockquotes: > for important notes or quotes
+4. **Referent clarity and consistent naming**
+    - Repeat the specific noun instead of relying on ambiguous pronouns (say "the equilibrium constant" instead of "it" when readers could be confused).
+    - Use the same name for a concept throughout; do not alternate between synonyms once a term is chosen.
 
-5. **Length and Comprehensiveness**:
-   - BEGINNER: 1000-1800 words - detailed and thorough with lots of explanation
-   - INTERMEDIATE: 800-1500 words - balanced depth covering the skill completely
-   - ADVANCED: 600-1200 words - dense, information-rich content
+5. **Vocabulary scaffolds**
+    - Define each technical term at first use with a short parenthetical explanation: **term** (simple definition).
+    - Pair specialized language with a familiar synonym when precision matters: "photosynthesis (how plants make food)".
 
-6. **Educational Value**: Ensure the content completely covers "{skill}" at the appropriate mastery level
+6. **Information ordering and fidelity to sources**
+    - Lead with the main point of each section before supporting details.
+    - Base all claims on the provided course materials. Do not invent new facts.
+    - Use lists instead of dense prose whenever you describe steps or categories.
 
-Generate the markdown content now:"""
+7. **Formatting requirements**
+    - Use Markdown headings (#, ##, ###), bullet lists, numbered lists, bold, and italics appropriately.
+    - Include code blocks only if the source materials contain runnable examples; otherwise prefer prose explanations.
+
+Generate the markdown content now without adding any questions or quiz items."""
 
         # Load LLM and generate
         self.embedder._load_llm()
 
         print('\nCalling LLM to generate reading material...')
-        response = self._call_llm_sync(prompt, max_tokens=2500)
+        response = self._call_llm_sync(prompt, max_tokens=1200)
 
         return response.strip()
 
-    def _call_llm_sync(self, prompt: str, max_tokens: int = 2000) -> str:
+    def _call_llm_sync(self, prompt: str, max_tokens: int = 1200) -> str:
         """
         Synchronous LLM call.
 

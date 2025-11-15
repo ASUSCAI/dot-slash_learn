@@ -9,12 +9,14 @@ Usage:
 '''
 
 import os
+import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Iterable
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
@@ -221,6 +223,27 @@ class ModuleStatusResponse(BaseModel):
     modules: List[ModuleStatus] = []
 
 
+class LearningObjectiveSummary(BaseModel):
+    """Metadata describing a unique learning objective stored in the collection."""
+
+    title: str
+    occurrence_count: int = 0
+    courses: List[str] = []
+    group_types: List[str] = []
+    sample_module_names: List[str] = []
+    last_ingested_at: Optional[str] = None
+
+
+class LearningObjectiveListResponse(BaseModel):
+    """Response containing available learning objectives."""
+
+    success: bool
+    collection_name: str
+    course: Optional[str]
+    group_type: Optional[str]
+    learning_objectives: List[LearningObjectiveSummary] = []
+
+
 class QuizGenerateRequest(BaseModel):
     """Request model for quiz generation endpoint"""
     learning_objective: str = Field(
@@ -388,6 +411,91 @@ def get_materials_root() -> Path:
         return base
 
 
+def _is_within_root(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _prune_empty_parents(path: Path, root: Path) -> None:
+    try:
+        root_resolved = root.resolve()
+    except Exception:
+        root_resolved = root
+
+    current = path.parent
+    while True:
+        try:
+            current_resolved = current.resolve()
+        except FileNotFoundError:
+            # Parent already gone, move upward if possible
+            current_resolved = current
+
+        if current_resolved == root_resolved:
+            break
+        # Stop traversing once we leave the root tree
+        try:
+            current_resolved.relative_to(root_resolved)
+        except ValueError:
+            break
+
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
+def _cleanup_processed_files(
+    resolved_pairs: Iterable[Tuple[str, Path]],
+    materials_root: Path,
+) -> Tuple[List[str], List[str]]:
+    cleaned: List[str] = []
+    errors: List[str] = []
+    seen: set = set()
+
+    for _, resolved in resolved_pairs:
+        resolved_path = Path(resolved)
+        try:
+            resolved_real = resolved_path.resolve()
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            errors.append(f"Unable to resolve {resolved_path}: {exc}")
+            continue
+
+        if resolved_real in seen:
+            continue
+        seen.add(resolved_real)
+
+        if not _is_within_root(resolved_real, materials_root):
+            continue
+
+        if resolved_real.is_file():
+            try:
+                resolved_real.unlink()
+                cleaned.append(str(resolved_real))
+                _prune_empty_parents(resolved_real, materials_root)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                errors.append(f"Unable to remove {resolved_real}: {exc}")
+        elif resolved_real.is_dir():
+            # If a directory path was provided directly, attempt to remove if empty
+            try:
+                resolved_real.rmdir()
+                cleaned.append(str(resolved_real))
+            except OSError:
+                # Directory not empty; leave it in place
+                continue
+            except Exception as exc:
+                errors.append(f"Unable to remove directory {resolved_real}: {exc}")
+
+    return cleaned, errors
+
+
 def resolve_request_paths(
     file_paths: List[str],
     *,
@@ -456,7 +564,8 @@ async def root():
             "delete": "/api/v1/embed (DELETE)",
             "quiz_generate": "/api/v1/quiz/generate",
             "reading_generate": "/api/v1/reading/generate",
-            "embed_status": "/api/v1/embed/status"
+            "embed_status": "/api/v1/embed/status",
+            "learning_objectives": "/api/v1/embed/objectives",
         }
     }
 
@@ -629,7 +738,21 @@ async def embed_files(request: EmbedRequest):
             ingested_at=ingested_at,
         )
 
-        combined_errors = resolution_warnings + result['errors']
+        cleanup_errors: List[str] = []
+        cleaned_files: List[str] = []
+        if result.get('files_processed'):
+            cleaned_files, cleanup_errors = _cleanup_processed_files(resolved_pairs, materials_root)
+            if cleaned_files:
+                logger.info(
+                    "Removed %d processed file(s) from %s",
+                    len(cleaned_files),
+                    materials_root,
+                )
+            if cleanup_errors:
+                for entry in cleanup_errors:
+                    logger.warning("Cleanup warning: %s", entry)
+
+        combined_errors = resolution_warnings + result['errors'] + cleanup_errors
 
         response = EmbedResponse(
             success=result['success'],
@@ -675,6 +798,28 @@ async def embed_status(
     except Exception as exc:
         logger.error("Failed to load embed status: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Unable to fetch embed status.") from exc
+
+
+@app.get("/api/v1/embed/objectives", response_model=LearningObjectiveListResponse)
+async def list_learning_objectives(
+    collection_name: str = Query(default="cs_materials"),
+    course: Optional[str] = Query(default=None),
+    group_type: Optional[str] = Query(default=None),
+):
+    """Return all unique learning objectives for a collection."""
+    try:
+        embedder = get_embedder(collection_name)
+        objectives = embedder.list_learning_objectives(course=course, group_type=group_type)
+        return LearningObjectiveListResponse(
+            success=True,
+            collection_name=collection_name,
+            course=course,
+            group_type=group_type,
+            learning_objectives=objectives,
+        )
+    except Exception as exc:
+        logger.error("Failed to load learning objectives: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Unable to fetch learning objectives.") from exc
 
 
 @app.delete("/api/v1/embed", response_model=DeleteFileResponse)
@@ -827,6 +972,60 @@ async def generate_quiz(request: QuizGenerateRequest):
             error=str(e),
             num_questions_generated=0
         )
+
+
+@app.post("/api/v1/quiz/generate-stream")
+async def generate_quiz_stream(request: QuizGenerateRequest):
+    """Stream quiz questions sequentially as they are generated."""
+
+    total_requested = request.num_easy + request.num_medium + request.num_hard
+
+    if total_requested == 0:
+        raise HTTPException(status_code=400, detail="At least one question must be requested")
+
+    embedder = get_embedder(request.collection_name)
+    from quiz_generator import QuizGenerator
+    generator = QuizGenerator(
+        qdrant_client=embedder.client,
+        collection_name=request.collection_name,
+        embedder=embedder
+    )
+
+    async def _event_stream():
+        question_index = 0
+        try:
+            async for question in generator.iter_quiz_questions(
+                learning_objective=request.learning_objective,
+                skill=request.skill,
+                num_easy=request.num_easy,
+                num_medium=request.num_medium,
+                num_hard=request.num_hard,
+                question_style=request.question_style
+            ):
+                question_index += 1
+                payload = {
+                    "type": "question",
+                    "index": question_index,
+                    "total_expected": total_requested,
+                    "question": question,
+                }
+                yield json.dumps(payload).encode("utf-8") + b"\n"
+
+            completion_payload = {
+                "type": "complete",
+                "generated": question_index,
+                "total_expected": total_requested,
+            }
+            yield json.dumps(completion_payload).encode("utf-8") + b"\n"
+        except Exception as exc:
+            logger.error("Streaming quiz generation failed: %s", exc, exc_info=True)
+            error_payload = {
+                "type": "error",
+                "message": str(exc),
+            }
+            yield json.dumps(error_payload).encode("utf-8") + b"\n"
+
+    return StreamingResponse(_event_stream(), media_type="application/jsonl")
 
 
 @app.post("/api/v1/reading/generate", response_model=ReadingMaterialResponse)

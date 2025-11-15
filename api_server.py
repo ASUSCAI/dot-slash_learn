@@ -221,6 +221,101 @@ class ModuleStatusResponse(BaseModel):
     modules: List[ModuleStatus] = []
 
 
+class QuizGenerateRequest(BaseModel):
+    """Request model for quiz generation endpoint"""
+    learning_objective: str = Field(
+        ...,
+        description="The learning objective for the quiz",
+        min_length=1
+    )
+    skill: str = Field(
+        ...,
+        description="The specific skill to test",
+        min_length=1
+    )
+    num_easy: int = Field(
+        default=0,
+        description="Number of easy questions to generate",
+        ge=0,
+        le=20
+    )
+    num_medium: int = Field(
+        default=0,
+        description="Number of medium difficulty questions to generate",
+        ge=0,
+        le=20
+    )
+    num_hard: int = Field(
+        default=0,
+        description="Number of hard questions to generate",
+        ge=0,
+        le=20
+    )
+    question_style: str = Field(
+        default="concrete",
+        description="Explanation style: 'concrete' (example-driven with real-world scenarios) or 'abstract' (technical terminology and formal definitions)"
+    )
+    collection_name: str = Field(
+        default="cs_materials",
+        description="Qdrant collection to search for course materials"
+    )
+
+
+class QuizOption(BaseModel):
+    """Model for a quiz option"""
+    id: str = Field(..., description="Option identifier (A, B, C, D or true, false)")
+    text: str = Field(..., description="Option text")
+    explanation: str = Field(..., description="Explanation for why this option is correct/incorrect")
+    is_correct: bool = Field(..., description="Whether this is the correct answer")
+
+
+class QuizQuestion(BaseModel):
+    """Model for a quiz question"""
+    id: str = Field(..., description="Question identifier (q1, q2, etc.)")
+    type: str = Field(..., description="Question type: 'mcq' or 'true_false'")
+    question: str = Field(..., description="The question text")
+    options: List[QuizOption] = Field(..., description="List of answer options with explanations")
+    skill: str = Field(..., description="The skill this question tests")
+    difficulty: str = Field(..., description="Question difficulty: 'easy', 'medium', or 'hard'")
+
+
+class QuizGenerateResponse(BaseModel):
+    """Response model for quiz generation endpoint"""
+    success: bool
+    questions: List[QuizQuestion] = []
+    error: Optional[str] = None
+    num_questions_generated: int = 0
+
+
+class ReadingMaterialRequest(BaseModel):
+    """Request model for reading material generation endpoint"""
+    learning_objective: str = Field(
+        ...,
+        description="The learning objective for the reading material",
+        min_length=1
+    )
+    skill: str = Field(
+        ...,
+        description="The specific skill to generate material for",
+        min_length=1
+    )
+    mastery_level: str = Field(
+        default="beginner",
+        description="Learner's mastery level: 'beginner' (simple language, inline definitions, no jargon), 'intermediate' (technical depth with accessibility), or 'advanced' (full technical rigor)"
+    )
+    collection_name: str = Field(
+        default="cs_materials",
+        description="Qdrant collection to search for course materials"
+    )
+
+
+class ReadingMaterialResponse(BaseModel):
+    """Response model for reading material generation endpoint"""
+    success: bool
+    content: str = Field(default="", description="Generated markdown content")
+    error: Optional[str] = None
+
+
 # ============================================================================
 # Helper Functions
 # ============================================================================
@@ -358,7 +453,10 @@ async def root():
         "endpoints": {
             "query": "/api/v1/query",
             "embed": "/api/v1/embed",
-            "delete": "/api/v1/embed (DELETE)"
+            "delete": "/api/v1/embed (DELETE)",
+            "quiz_generate": "/api/v1/quiz/generate",
+            "reading_generate": "/api/v1/reading/generate",
+            "embed_status": "/api/v1/embed/status"
         }
     }
 
@@ -657,6 +755,136 @@ async def delete_files(request: DeleteFileRequest):
             message="Deletion failed",
             errors=[],
             error=str(e)
+        )
+
+
+@app.post("/api/v1/quiz/generate", response_model=QuizGenerateResponse)
+async def generate_quiz(request: QuizGenerateRequest):
+    """
+    Generate quiz questions with explanations based on skill and learning objective.
+
+    Pipeline:
+    1. Filter Qdrant for chunks matching the specified skill
+    2. Generate questions using LLM (80% MCQ, 20% True/False)
+    3. Parallel generation of explanations for each option
+
+    Each option gets a separate LLM conversation for explanation generation,
+    allowing for parallelization and avoiding context overflow.
+    """
+    try:
+        total_questions = request.num_easy + request.num_medium + request.num_hard
+        logger.info(f"Generating {total_questions} questions for skill: {request.skill} "
+                   f"(Easy: {request.num_easy}, Medium: {request.num_medium}, Hard: {request.num_hard})")
+
+        # Validate that at least one question is requested
+        if total_questions == 0:
+            return QuizGenerateResponse(
+                success=False,
+                error="At least one question must be requested (num_easy, num_medium, or num_hard must be > 0)",
+                num_questions_generated=0
+            )
+
+        # Get embedder for LLM access
+        embedder = get_embedder(request.collection_name)
+
+        # Initialize quiz generator
+        from quiz_generator import QuizGenerator
+        generator = QuizGenerator(
+            qdrant_client=embedder.client,
+            collection_name=request.collection_name,
+            embedder=embedder
+        )
+
+        # Generate quiz (await since it's now async)
+        questions = await generator.generate_quiz(
+            learning_objective=request.learning_objective,
+            skill=request.skill,
+            num_easy=request.num_easy,
+            num_medium=request.num_medium,
+            num_hard=request.num_hard,
+            question_style=request.question_style
+        )
+
+        if not questions:
+            return QuizGenerateResponse(
+                success=False,
+                error=f"Failed to generate questions for skill: {request.skill}. No matching content found.",
+                num_questions_generated=0
+            )
+
+        logger.info(f"Successfully generated {len(questions)} questions")
+
+        return QuizGenerateResponse(
+            success=True,
+            questions=questions,
+            num_questions_generated=len(questions)
+        )
+
+    except Exception as e:
+        logger.error(f"Quiz generation failed: {e}", exc_info=True)
+        return QuizGenerateResponse(
+            success=False,
+            error=str(e),
+            num_questions_generated=0
+        )
+
+
+@app.post("/api/v1/reading/generate", response_model=ReadingMaterialResponse)
+async def generate_reading_material(request: ReadingMaterialRequest):
+    """
+    Generate educational reading material in markdown format.
+
+    Pipeline:
+    1. Filter Qdrant for chunks matching the specified skill
+    2. Generate structured markdown content using LLM
+    3. Format with proper markdown syntax (headings, lists, code blocks, etc.)
+
+    The mastery_level parameter determines the content approach:
+    - beginner: Simple language, inline definitions, no jargon/idioms, step-by-step explanations
+    - intermediate: Technical depth with accessibility, balance of simplicity and detail
+    - advanced: Full technical rigor, industry-standard terminology, assumes prior knowledge
+    """
+    try:
+        logger.info(f"Generating reading material for skill: {request.skill} (mastery: {request.mastery_level})")
+
+        # Get embedder for LLM access
+        embedder = get_embedder(request.collection_name)
+
+        # Initialize reading material generator
+        from reading_material_generator import ReadingMaterialGenerator
+        generator = ReadingMaterialGenerator(
+            qdrant_client=embedder.client,
+            collection_name=request.collection_name,
+            embedder=embedder
+        )
+
+        # Generate reading material (await since it's async)
+        content = await generator.generate_reading_material(
+            learning_objective=request.learning_objective,
+            skill=request.skill,
+            mastery_level=request.mastery_level
+        )
+
+        if not content or len(content.strip()) == 0:
+            return ReadingMaterialResponse(
+                success=False,
+                error=f"Failed to generate reading material for skill: {request.skill}. No content generated.",
+                content=""
+            )
+
+        logger.info(f"Successfully generated reading material ({len(content)} characters)")
+
+        return ReadingMaterialResponse(
+            success=True,
+            content=content
+        )
+
+    except Exception as e:
+        logger.error(f"Reading material generation failed: {e}", exc_info=True)
+        return ReadingMaterialResponse(
+            success=False,
+            error=str(e),
+            content=""
         )
 
 

@@ -3,9 +3,9 @@ RAG Query System with Two-Stage Reranking
 
 Advanced RAG implementation with sibling file expansion:
 1. Takes a user query
-2. Embeds it using Qwen/Qwen3-Embedding-4B
+2. Embeds it using a local Alibaba-NLP/gte-large-en-v1.5 SentenceTransformer
 3. Searches Qdrant for top 10 relevant course materials
-4. STAGE 1: Reranks using Qwen/Qwen3-Reranker-4B to get top 3
+4. STAGE 1: Reranks using Jetstream-hosted Llama 4 Scout to get top 3
 5. STAGE 2: Expands top 3 with their sibling files (from Qdrant or disk)
 6. Final rerank of expanded set to get final top 3 documents
 
@@ -19,29 +19,46 @@ Usage:
 '''
 
 import argparse
-import torch
 import os
 import PyPDF2
-from typing import List
+from typing import List, Optional
+
 from qdrant_client import QdrantClient
-from transformers import AutoTokenizer, AutoModel
+
+from jetstream_client import JetstreamInferenceClient, _get_env
+from local_embedding import LocalEmbeddingClient
 
 
 class QueryEngine:
 
-    def __init__(self, qdrant_host: str = 'localhost', qdrant_port: int = 6333, collection_name: str = 'cs_materials'):
+    def __init__(
+        self,
+        qdrant_host: str = 'localhost',
+        qdrant_port: int = 6333,
+        collection_name: str = 'cs_materials',
+        use_remote_embedding: bool | None = None,  # kept for API compatibility
+        jetstream_client: Optional[JetstreamInferenceClient] = None,
+    ):
         self.collection_name = collection_name
+        if use_remote_embedding:
+            print('Local embedding mode active; ignoring legacy remote flag.')
 
-        # Setup device
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f'Using device: {self.device}')
+        if jetstream_client is not None:
+            self.jetstream_client = jetstream_client
+        else:
+            self.jetstream_client = JetstreamInferenceClient(
+                base_url=_get_env('JETSTREAM_BASE_URL'),
+                model=_get_env('JETSTREAM_MODEL'),
+            )
 
-        # Load embedding model (same as course_embedder.py)
-        print('Loading Qwen/Qwen3-Embedding-4B model...')
-        self.tokenizer = AutoTokenizer.from_pretrained('Qwen/Qwen3-Embedding-4B')
-        self.model = AutoModel.from_pretrained('Qwen/Qwen3-Embedding-4B')
-        self.model.to(self.device)
-        self.model.eval()
+        self.embedding_client = LocalEmbeddingClient()
+        self.embedding_model_name = self.embedding_client.model_name
+        self.embed_dimension = self.embedding_client.dimension
+
+        print(
+            'Using local embedding model: '
+            f"{self.embedding_model_name} (dim={self.embed_dimension}, device={self.embedding_client.device})"
+        )
 
         # Connect to Qdrant
         self.client = QdrantClient(host=qdrant_host, port=qdrant_port)
@@ -60,21 +77,10 @@ class QueryEngine:
 
     def embed_query(self, query: str) -> List[float]:
         """Embed the query using the same model as course materials"""
-        inputs = self.tokenizer(
-            query,
-            return_tensors='pt',
-            truncation=True,
-            max_length=8192,
-            padding=True
-        )
-
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            embedding = outputs.last_hidden_state[:, 0, :].squeeze()
-
-        return embedding.cpu().numpy().tolist()
+        embeddings = self.embedding_client.embed(query)
+        if not embeddings:
+            raise RuntimeError('Local embedding request returned no vector for query')
+        return embeddings[0]
 
     def search(self, query: str, top_k: int = 3, use_reranker: bool = False, rerank_candidates: int = 50, stage1_top_k: int = 7, min_score: float = 7.0, verbose: bool = True):
         """
@@ -133,7 +139,7 @@ class QueryEngine:
         if use_reranker:
             from reranker import DocumentReranker
 
-            reranker = DocumentReranker(verbose=verbose)
+            reranker = DocumentReranker(verbose=verbose, jetstream_client=self.jetstream_client)
 
             # STAGE 1: First rerank to get top N (default: 7)
             if verbose:

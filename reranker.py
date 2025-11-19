@@ -1,9 +1,9 @@
 '''
 Reranker Module for RAG Results
 
-Uses Qwen3-Reranker-4B to rerank documents retrieved from vector search.
+Uses Jetstream-hosted Llama 4 Scout to rerank documents retrieved from vector search.
 This provides more accurate relevance scoring by considering the full context
-of both the query and document together.
+of both the query and document together without requiring local transformer models.
 
 This is meant to be imported and used as a module in other scripts.
 
@@ -21,43 +21,33 @@ Usage:
         print(f"File: {result['payload']['file_path']}")
 '''
 
-import torch
-from typing import List, Dict, Any, Tuple
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from typing import List, Dict, Any, Tuple, Optional
+
+from jetstream_client import JetstreamInferenceClient, _get_env
 
 
 class DocumentReranker:
-    """
-    Reranker that uses Qwen3-Reranker-4B to rerank search results.
-    """
+    """Jetstream-based reranker for search results."""
 
-    def __init__(self, device: str = None, verbose: bool = True):
-        """
-        Initialize the reranker model.
-
-        Args:
-            device: Device to use ('cuda' or 'cpu'). Auto-detects if None.
-            verbose: Whether to print loading messages.
-        """
+    def __init__(
+        self,
+        *,
+        verbose: bool = True,
+        jetstream_client: Optional[JetstreamInferenceClient] = None,
+    ) -> None:
         self.verbose = verbose
-
-        # Setup device
-        if device:
-            self.device = torch.device(device)
+        if jetstream_client is not None:
+            self.jetstream_client = jetstream_client
         else:
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.jetstream_client = JetstreamInferenceClient(
+                base_url=_get_env('JETSTREAM_RERANK_BASE_URL') or _get_env('JETSTREAM_BASE_URL'),
+                model=_get_env('JETSTREAM_RERANK_MODEL') or _get_env('JETSTREAM_MODEL') or 'llama-4-scout',
+                api_key=_get_env('JETSTREAM_RERANK_API_KEY') or _get_env('JETSTREAM_API_KEY'),
+                timeout=int(_get_env('JETSTREAM_RERANK_TIMEOUT', _get_env('JETSTREAM_TIMEOUT') or '120')),
+            )
 
         if self.verbose:
-            print('Loading Qwen/Qwen3-Reranker-4B model...')
-
-        # Load reranker model with sequence classification head
-        self.rerank_tokenizer = AutoTokenizer.from_pretrained('Qwen/Qwen3-Reranker-4B')
-        self.rerank_model = AutoModelForSequenceClassification.from_pretrained('Qwen/Qwen3-Reranker-4B')
-        self.rerank_model.to(self.device)
-        self.rerank_model.eval()
-
-        if self.verbose:
-            print(f'Reranker loaded on {self.device}\n')
+            print('Reranker mode: Jetstream remote scoring')
 
     def compute_rerank_score(self, query: str, document: str) -> float:
         """
@@ -71,41 +61,40 @@ class DocumentReranker:
         Returns:
             Relevance score (higher = more relevant)
         """
-        # Truncate document to prevent OOM (keep first 3000 chars, ~750 tokens)
-        if len(document) > 3000:
-            document = document[:3000] + "..."
+        return self._compute_remote_score(query, document)
 
-        inputs = self.rerank_tokenizer(
-            query,
-            document,
-            return_tensors='pt',
-            truncation=True,
-            max_length=4096,  # Reduced from 8192 to save memory
-            padding=True
-        )
+    def _compute_remote_score(self, query: str, document: str) -> float:
+        """Use Jetstream LLM to estimate a relevance score."""
+        doc_excerpt = document
+        if len(doc_excerpt) > 2000:
+            doc_excerpt = doc_excerpt[:2000] + '...'
 
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You score how relevant a document chunk is to a user query for an educational RAG system. "
+                    "Respond with JSON containing: score (float from 0 to 10) and rationale (string)."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Query: {query}\n\nDocument:\n{doc_excerpt}",
+            },
+        ]
 
-        with torch.no_grad():
-            outputs = self.rerank_model(**inputs)
+        try:
+            assessment = self.jetstream_client.chat_completion_json(messages, max_tokens=200, temperature=0)
+        except RuntimeError as exc:
+            if self.verbose:
+                print(f'  ⚠ Remote reranker error: {exc}')
+            return 0.0
 
-            # For sequence classification models, logits contain the relevance scores
-            # Typically: [batch_size, num_classes] where num_classes might be 1 or 2
-            logits = outputs.logits
-
-            # If binary classification (2 classes), use the positive class score
-            if logits.shape[-1] == 2:
-                # Class 1 is typically "relevant"
-                relevance_score = logits[0, 1].cpu().item()
-            else:
-                # Single output score
-                relevance_score = logits[0, 0].cpu().item()
-
-        # Clear CUDA cache after each scoring to prevent memory accumulation
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
-
-        return relevance_score
+        score = assessment.get('score')
+        try:
+            return max(0.0, min(float(score), 10.0))
+        except (TypeError, ValueError):
+            return 0.0
 
     def rerank(self, query: str, results: List[Dict[str, Any]], min_score: float = None) -> List[Tuple[Dict[str, Any], float]]:
         """
@@ -170,7 +159,5 @@ class DocumentReranker:
 
     def offload_to_cpu(self):
         """Move the reranker model to CPU to free VRAM"""
-        if self.device.type == 'cuda':
-            self.rerank_model.to('cpu')
-            if self.verbose:
-                print('Reranker moved to CPU')
+        if self.verbose:
+            print('Remote reranker is stateless; offload_to_cpu is a no-op')

@@ -21,6 +21,16 @@ uvicorn api_server:app --reload --host 0.0.0.0 --port 8000
 
 API docs: http://localhost:8000/docs
 
+### Embeddings & Jetstream Toggles
+
+Embeddings now use the lighter-weight [Alibaba-NLP/gte-large-en-v1.5](https://huggingface.co/Alibaba-NLP/gte-large-en-v1.5) sentence transformer. Override the model by exporting `EMBEDDING_MODEL_NAME` before starting the API.
+
+Jetstream still handles guardrails, reranking, and text generation. If you set `JETSTREAM_DISABLE_LOCAL_MODELS=1`, embeddings continue to run locally (Jetstream2 does not expose an embedding service) while other components switch to Jetstream-hosted models. Fine-grained controls remain available:
+
+- `JETSTREAM_REMOTE_RERANKER`
+- `JETSTREAM_REMOTE_LLM`
+- `JETSTREAM_GUARD_MODEL` / related base-url overrides
+
 ## Usage
 
 ```bash

@@ -16,7 +16,6 @@ Usage:
 '''
 
 import json
-import torch
 import asyncio
 from typing import List, Dict, Any, Optional, Callable, Awaitable, Tuple
 from concurrent.futures import ThreadPoolExecutor
@@ -84,9 +83,8 @@ class QuizGenerator:
 
         # VRAM OPTIMIZATION: Offload embedding model to free VRAM
         print('\n' + '='*80)
-        print('FREEING VRAM: Offloading embedding model to CPU...')
+        print('LOCAL EMBEDDING: Alibaba gte-large runs locally; model stays resident for faster generation.')
         print('='*80)
-        self._offload_embedding_model()
 
         # Phase 1: Retrieve chunks and lazily generate questions
         print('\n' + '='*80)
@@ -210,9 +208,8 @@ class QuizGenerator:
 
         # VRAM CLEANUP: Offload LLM and restore embedding model
         print('\n' + '='*80)
-        print('CLEANUP: Offloading LLM and restoring embedding model...')
+        print('CLEANUP: Local embedder remains loaded; no additional teardown performed.')
         print('='*80)
-        self._cleanup_vram()
 
         return final_questions
 
@@ -572,74 +569,24 @@ Explanation:"""
         Returns:
             LLM response text
         """
-        # Ensure LLM is loaded
-        self.embedder._load_llm()
-
-        messages = [{"role": "user", "content": prompt}]
-        text = self.embedder.llm_processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        return self.embedder.generate_text(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=0.7,
+            top_p=0.9,
         )
-        inputs = self.embedder.llm_processor(text=text, return_tensors='pt')
-        inputs = {k: v.to(self.embedder.llm_device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = self.embedder.llm.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True
-            )
-
-        response = self.embedder.llm_processor.decode(
-            outputs[0][inputs['input_ids'].shape[1]:],
-            skip_special_tokens=True
-        )
-
-        return response.strip()
 
     def _offload_embedding_model(self):
-        """Offload embedding model to CPU to free VRAM for LLM"""
-        try:
-            if hasattr(self.embedder, 'model') and self.embedder.model is not None:
-                print('  Offloading embedding model to CPU...')
-                self.embedder.model.to('cpu')
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                print('  ✓ Embedding model offloaded, VRAM freed')
-        except Exception as e:
-            print(f'  Warning: Could not offload embedding model: {e}')
+        """Compatibility no-op for legacy GPU workflow."""
+        print('  Local embedder remains in memory; offload is not implemented.')
 
     def _restore_embedding_model(self):
-        """Restore embedding model back to GPU"""
-        try:
-            if hasattr(self.embedder, 'model') and self.embedder.model is not None:
-                print('  Restoring embedding model to GPU...')
-                self.embedder.model.to(self.embedder.device)
-                print('  ✓ Embedding model restored to GPU')
-        except Exception as e:
-            print(f'  Warning: Could not restore embedding model: {e}')
+        """Compatibility no-op for legacy GPU workflow."""
+        print('  Local embedder was never offloaded; nothing to restore.')
 
     def _cleanup_vram(self):
-        """Cleanup VRAM by offloading LLM and restoring embedding model"""
-        try:
-            # Offload LLM to CPU
-            if self.embedder.llm is not None:
-                print('  Offloading LLM to CPU...')
-                self.embedder.llm.to('cpu')
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                print('  ✓ LLM offloaded to CPU')
-
-            # Restore embedding model to GPU
-            self._restore_embedding_model()
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                print('  ✓ VRAM cleanup complete')
-
-        except Exception as e:
-            print(f'  Warning: VRAM cleanup encountered issue: {e}')
+        """Compatibility no-op for legacy GPU workflow."""
+        print('  Jetstream LLM stays remote; no VRAM cleanup required locally.')
 
     def __del__(self):
         """Cleanup executor on deletion"""

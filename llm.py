@@ -2,7 +2,7 @@
 LLM Query System with RAG
 
 Main entry point for querying course materials with LLM assistance.
-Performs two-stage reranking RAG and passes context to Qwen3-VL-4B-Instruct.
+Performs two-stage reranking RAG and delegates generation to Jetstream inference service models.
 
 Usage:
     python llm.py "What is dynamic programming?"
@@ -10,67 +10,88 @@ Usage:
 '''
 
 import argparse
-import torch
-from typing import List, Dict, Any, Tuple
-from transformers import AutoTokenizer, AutoModelForImageTextToText, AutoProcessor
-from query import QueryEngine
+import os
+from typing import List, Dict, Any, Tuple, Optional
+
 from guardrails import SafetyGuardrails
+from jetstream_client import JetstreamInferenceClient, _get_env
+from query import QueryEngine
 
 
 class LLMQuerySystem:
 
-    def __init__(self, collection_name: str = 'cs_materials', qdrant_host: str = 'localhost', qdrant_port: int = 6333, enable_guardrails: bool = True):
+    def __init__(
+        self,
+        collection_name: str = 'cs_materials',
+        qdrant_host: str = 'localhost',
+        qdrant_port: int = 6333,
+        enable_guardrails: bool = True,
+        rewrite_base_url: Optional[str] = None,
+        rewrite_model: Optional[str] = None,
+        answer_base_url: Optional[str] = None,
+        answer_model: Optional[str] = None,
+        api_key: Optional[str] = None,
+        request_timeout: int = 120,
+    ):
         """
-        Initialize the LLM query system with RAG.
+        Initialize the LLM query system with RAG and Jetstream inference service.
 
         Args:
             collection_name: Qdrant collection to search
             qdrant_host: Qdrant host address
             qdrant_port: Qdrant port
             enable_guardrails: Whether to enable safety guardrails
+            rewrite_base_url: Base URL for the Jetstream model used in query rewriting
+            rewrite_model: Model ID for query rewriting
+            answer_base_url: Base URL for the Jetstream model used in answer generation
+            answer_model: Model ID for answer generation
+            api_key: API token if connecting via the Open WebUI proxy (optional)
+            request_timeout: Timeout (seconds) for Jetstream API requests
         """
-        # Setup device
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f'Using device: {self.device}')
+        base_url = (
+            answer_base_url
+            or rewrite_base_url
+            or _get_env('JETSTREAM_BASE_URL')
+            or 'https://llm.jetstream-cloud.org/llama-4-scout/v1'
+        )
+        model = (
+            answer_model
+            or rewrite_model
+            or _get_env('JETSTREAM_MODEL')
+            or 'llama-4-scout'
+        )
+        client_api_key = api_key or _get_env('JETSTREAM_API_KEY')
+
+        print('\n' + '='*80)
+        print('CONFIGURING JETSTREAM INFERENCE CLIENT')
+        print('='*80)
+        self.jetstream_client = JetstreamInferenceClient(
+            base_url=base_url,
+            model=model,
+            api_key=client_api_key,
+            timeout=request_timeout,
+        )
+        print(f'Jetstream model: {self.jetstream_client.model} @ {self.jetstream_client.base_url}\n')
 
         # Initialize RAG query engine
-        print('\n' + '='*80)
+        print('='*80)
         print('INITIALIZING RAG SYSTEM')
         print('='*80)
         self.query_engine = QueryEngine(
             qdrant_host=qdrant_host,
             qdrant_port=qdrant_port,
-            collection_name=collection_name
+            collection_name=collection_name,
+            jetstream_client=self.jetstream_client,
         )
 
-        # Initialize guardrails (on CPU to save VRAM)
+        # Initialize guardrails (on CPU to avoid large local allocations)
         self.enable_guardrails = enable_guardrails
         self.guardrails = None
         if self.enable_guardrails:
             print('\n' + '='*80)
             print('INITIALIZING GUARDRAILS')
             print('='*80)
-            self.guardrails = SafetyGuardrails(device='cpu', verbose=True)
-
-        # Don't load LLM yet - we'll lazy load it after RAG to save VRAM
-        self.llm = None
-        self.processor = None
-        print('\nLLM will be loaded after RAG completes (lazy loading to save VRAM)\n')
-
-    def _load_llm(self):
-        """Lazy load the LLM model when needed"""
-        if self.llm is None:
-            print('\n' + '='*80)
-            print('LOADING LLM: Qwen3-VL-4B-Instruct')
-            print('='*80)
-            self.processor = AutoProcessor.from_pretrained('Qwen/Qwen3-VL-4B-Instruct')
-            self.llm = AutoModelForImageTextToText.from_pretrained(
-                'Qwen/Qwen3-VL-4B-Instruct',
-                dtype=torch.float16 if self.device.type == 'cuda' else torch.float32,
-                device_map='auto'
-            )
-            self.llm.eval()
-            print(f'LLM loaded successfully\n')
+            self.guardrails = SafetyGuardrails(verbose=True, jetstream_client=self.jetstream_client)
 
     def _rewrite_query(self, original_query: str) -> str:
         """
@@ -85,62 +106,32 @@ class LLMQuerySystem:
         Returns:
             Rewritten query optimized for RAG retrieval
         """
-        # Load LLM if not already loaded (should be on GPU)
-        self._load_llm()
+        system_prompt = (
+            "You optimize user queries for a Retrieval-Augmented Generation (RAG) system "
+            "covering computer science course materials. Expand short questions into detailed, "
+            "technical language that improves vector similarity search. Respond with a single "
+            "concise line that keeps the original intent."
+        )
+        user_prompt = (
+            f"Original question: \"{original_query}\"\n"
+            "Include relevant CS terminology, synonyms, and related concepts. Return only the rewritten query."
+        )
 
-        # Build prompt for query rewriting with better instructions
-        rewrite_prompt = f"""You are improving search accuracy for a Retrieval-Augmented Generation (RAG) system that searches computer science course materials.
-
-The RAG system uses vector similarity search - it embeds queries and documents, then finds the most similar documents. Simple queries often don't match well with technical course content.
-
-Your task: Rewrite the user's question to include MORE technical terminology, synonyms, related concepts, and CS-specific vocabulary. This will improve the embedding similarity with course materials.
-
-Original question: "{original_query}"
-
-Guidelines:
-- Add technical terms and synonyms (e.g., "OOP" → "object-oriented programming, OOP, encapsulation, inheritance, polymorphism")
-- Include related concepts that appear in course materials
-- Expand abbreviations and add full terms
-- Keep the same meaning but make it more detailed and technical
-- Make it sound like how a CS textbook or lecture would phrase it
-
-Examples:
-Input: "What is DP?"
-Output: "dynamic programming algorithms, DP optimization technique, memoization and tabulation, optimal substructure property, overlapping subproblems, recursive solutions with caching"
-
-Input: "How do loops work?"
-Output: "iteration and loops in programming, for loops and while loops, loop control flow, iterative structures, loop counters and conditions, nested loops and loop execution"
-
-Now rewrite this query for better RAG search results:"""
-
-        # Format as conversation
         messages = [
-            {
-                "role": "user",
-                "content": rewrite_prompt
-            }
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ]
 
-        # Apply chat template and tokenize
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.processor(text=text, return_tensors='pt')
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        # Generate rewritten query
-        with torch.no_grad():
-            outputs = self.llm.generate(
-                **inputs,
-                max_new_tokens=100,  # Keep it concise
-                temperature=0.5,      # Moderate temperature
+        try:
+            rewritten = self.jetstream_client.chat_completion(
+                messages,
+                max_tokens=120,
+                temperature=0.5,
                 top_p=0.9,
-                do_sample=True
             )
-
-        # Decode response (skip the input prompt tokens)
-        rewritten = self.processor.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
-
-        # Clean up the response
-        rewritten = rewritten.strip()
+        except RuntimeError as exc:
+            print(f'⚠ Query rewriting failed ({exc}); using original question.')
+            return original_query
 
         # Remove any common prefixes the model might add
         prefixes_to_remove = ['Output:', 'Expanded query:', 'Answer:', 'A:', 'Q:']
@@ -157,6 +148,28 @@ Now rewrite this query for better RAG search results:"""
             return original_query
 
         return rewritten
+
+    def _generate_response(self, prompt: str, max_tokens: int) -> str:
+        """Call the Jetstream inference service to generate a response."""
+        max_tokens = max(32, min(max_tokens, 4096))
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful teaching assistant for computer science courses. "
+                    "Use the provided context when available. If the context is missing, answer "
+                    "from general knowledge and be clear about any limitations."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+        return self.jetstream_client.chat_completion(
+            messages,
+            max_tokens=max_tokens,
+            temperature=0.7,
+            top_p=0.9,
+        )
 
     def format_context(self, documents: List[Tuple[Dict[str, Any], float]]) -> str:
         """
@@ -193,33 +206,7 @@ Now rewrite this query for better RAG search results:"""
         return '\n' + ('='*80) + '\n\n'.join(context_parts) + '\n' + ('='*80)
 
     def query(self, user_query: str, show_context: bool = True, max_length: int = 2048):
-        """
-        Query the LLM with RAG context.
-
-        VRAM Management Strategy:
-        1. Guardrails (CPU) + LLM (GPU) for input validation and query rewriting
-        2. Offload guardrails + LLM, load embedder + reranker for RAG
-        3. Offload RAG models, reload guardrails + LLM for answer generation
-
-        Args:
-            user_query: The user's question
-            show_context: Whether to print the retrieved documents (for debugging)
-            max_length: Maximum length of generated response
-
-        Returns:
-            LLM response string
-        """
-        # PHASE 1: INPUT VALIDATION & QUERY REWRITING (Guardrails + LLM on GPU)
-        # ============================================================================
-
-        # Move guardrails to GPU for faster validation
-        if self.enable_guardrails:
-            print('\n' + '='*80)
-            print('LOADING GUARDRAILS to GPU...')
-            print('='*80)
-            self.guardrails.move_to_gpu()
-            print('Guardrails ready on GPU\n')
-
+        """Query the Jetstream-backed LLM with optional RAG context."""
         # GUARDRAIL CHECKPOINT 1: Validate input query
         if self.enable_guardrails:
             print('\n' + '='*80)
@@ -245,87 +232,41 @@ Now rewrite this query for better RAG search results:"""
         print(f'Rewritten query: "{rewritten_query}"')
         print('='*80)
 
-        # PHASE 2: RAG RETRIEVAL (Embedder + Reranker on GPU)
-        # ============================================================================
-
-        # Offload guardrails and LLM to CPU to free VRAM for RAG models
-        print('\n' + '='*80)
-        print('FREEING VRAM: Moving Guardrails + LLM to CPU for RAG...')
-        print('='*80)
-
-        if self.enable_guardrails:
-            self.guardrails.offload_to_cpu()
-
-        if self.llm is not None:
-            self.llm.to('cpu')
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        print('VRAM freed\n')
-
         # Stage 1 & 2: Perform RAG with two-stage reranking using rewritten query
         print('\n' + '='*80)
         print('RETRIEVING RELEVANT DOCUMENTS')
         print('='*80)
 
         documents = self.query_engine.search(
-            query=rewritten_query,  # Use rewritten query for embedding
-            top_k=3,               # Final number of documents to pass to LLM
+            query=rewritten_query,
+            top_k=3,
             use_reranker=True,
-            rerank_candidates=50,  # Retrieve 50 candidates from vector search
-            stage1_top_k=7,        # Keep top 7 after first rerank, then expand with neighbors
-            min_score=7.0,         # Minimum reranker score threshold
+            rerank_candidates=50,
+            stage1_top_k=7,
+            min_score=7.0,
             verbose=True
         )
 
-        # Allow LLM to answer without RAG if no documents pass the threshold
         use_rag = len(documents) > 0
+        context = ''
+        context_texts: List[str] = []
 
-        # PHASE 3: ANSWER GENERATION (LLM + Guardrails on GPU)
-        # ============================================================================
-
-        # Offload RAG models to CPU to free VRAM for LLM
-        print('\n' + '='*80)
-        print('FREEING VRAM: Moving RAG models to CPU...')
-        print('='*80)
-        self.query_engine.model.to('cpu')
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        print('VRAM freed\n')
-
-        # Format context if we have documents
         if use_rag:
             context = self.format_context(documents)
-
-            # Show retrieved documents for debugging
             if show_context:
                 print('\n' + '='*80)
                 print('RETRIEVED DOCUMENTS (Context for LLM)')
                 print('='*80)
                 print(context)
+
+            for result, _ in documents:
+                payload = result['payload']
+                context_texts.append(payload.get('full_content', payload.get('content_preview', '')))
         else:
             print('\n' + '='*80)
             print('⚠ NO DOCUMENTS PASSED THRESHOLD - LLM will answer without RAG')
             print('='*80)
 
-        # Reload LLM and Guardrails to GPU for answer generation
-        print('\n' + '='*80)
-        print('RELOADING LLM + GUARDRAILS to GPU for answer generation...')
-        print('='*80)
-
-        # Move LLM back to GPU
-        if self.llm is not None:
-            self.llm.to(self.device)
-        else:
-            self._load_llm()
-
-        # Move guardrails back to GPU
-        if self.enable_guardrails:
-            self.guardrails.move_to_gpu()
-
-        print('LLM + Guardrails ready on GPU\n')
-
-        # Build prompt using ORIGINAL user query (not rewritten)
         if use_rag:
             prompt = f"""Based on the following course materials, please answer the question. Use the information from the documents to provide a comprehensive and accurate answer.
 
@@ -341,40 +282,21 @@ Question: {user_query}
 
 Answer:"""
 
-        # Generate response
+        # Generate response via Jetstream inference service
         print('\n' + '='*80)
-        print('GENERATING RESPONSE')
+        print('GENERATING RESPONSE VIA JETSTREAM INFERENCE SERVICE')
         print('='*80 + '\n')
 
-        # Format as conversation for the vision-language model
-        messages = [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
+        try:
+            response = self._generate_response(prompt, max_length)
+        except RuntimeError as exc:
+            print(f'\n✗ RESPONSE GENERATION FAILED: {exc}')
+            print('='*80)
+            return f"I could not contact the Jetstream inference service. Error: {exc}"
 
-        # Apply chat template and tokenize
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.processor(text=text, return_tensors='pt')
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        # Generate
-        with torch.no_grad():
-            outputs = self.llm.generate(
-                **inputs,
-                max_new_tokens=max_length,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True
-            )
-
-        # Decode response
-        response = self.processor.decode(outputs[0], skip_special_tokens=True)
-
-        # Extract just the answer part (after "Answer:")
-        if "Answer:" in response:
-            response = response.split("Answer:")[-1].strip()
+        response = response.strip()
+        if response.lower().startswith('answer:'):
+            response = response.split(':', 1)[-1].strip()
 
         # GUARDRAIL CHECKPOINT 2: Validate output response
         if self.enable_guardrails:
@@ -382,19 +304,11 @@ Answer:"""
             print('GUARDRAIL CHECK: Validating Output Response')
             print('='*80)
 
-            # Extract content from documents for grounding check (if we have any)
-            context_texts = []
-            if use_rag:
-                for result, score in documents:
-                    payload = result['payload']
-                    content = payload.get('full_content', payload.get('content_preview', ''))
-                    context_texts.append(content)
-
             is_safe, reason, sanitized_response = self.guardrails.validate_output(
                 query=user_query,
                 response=response,
                 context=context_texts if use_rag else None,
-                check_hallucination=use_rag,  # Only check hallucination if we have context
+                check_hallucination=use_rag,
                 check_pii=True
             )
 
@@ -403,7 +317,6 @@ Answer:"""
                 print('='*80)
                 return f"I generated a response, but it failed safety validation. Reason: {reason}"
 
-            # Use sanitized response if PII was redacted
             if sanitized_response:
                 response = sanitized_response
 
@@ -441,13 +354,55 @@ def main():
         action='store_true',
         help='Disable safety guardrails (not recommended)'
     )
+    parser.add_argument(
+        '--rewrite-base-url',
+        type=str,
+        default=os.environ.get('JETSTREAM_REWRITE_BASE_URL'),
+        help='Override Jetstream base URL for query rewriting (default: https://llm.jetstream-cloud.org/llama-4-scout/v1)'
+    )
+    parser.add_argument(
+        '--rewrite-model',
+        type=str,
+        default=os.environ.get('JETSTREAM_REWRITE_MODEL'),
+        help='Override Jetstream model ID for query rewriting (default: llama-4-scout)'
+    )
+    parser.add_argument(
+        '--answer-base-url',
+        type=str,
+        default=os.environ.get('JETSTREAM_ANSWER_BASE_URL'),
+        help='Override Jetstream base URL for answer generation (default: https://llm.jetstream-cloud.org/gpt-oss-120b/v1)'
+    )
+    parser.add_argument(
+        '--answer-model',
+        type=str,
+        default=os.environ.get('JETSTREAM_ANSWER_MODEL'),
+        help='Override Jetstream model ID for answer generation (default: gpt-oss-120b)'
+    )
+    parser.add_argument(
+        '--jetstream-api-key',
+        type=str,
+        default=os.environ.get('JETSTREAM_API_KEY'),
+        help='Jetstream API token (required when using the Open WebUI proxy)'
+    )
+    parser.add_argument(
+        '--jetstream-timeout',
+        type=int,
+        default=int(os.environ.get('JETSTREAM_TIMEOUT', '120')),
+        help='Timeout in seconds for Jetstream inference requests (default: 120)'
+    )
 
     args = parser.parse_args()
 
     # Initialize system
     system = LLMQuerySystem(
         collection_name=args.collection,
-        enable_guardrails=not args.no_guardrails
+        enable_guardrails=not args.no_guardrails,
+        rewrite_base_url=args.rewrite_base_url,
+        rewrite_model=args.rewrite_model,
+        answer_base_url=args.answer_base_url,
+        answer_model=args.answer_model,
+        api_key=args.jetstream_api_key,
+        request_timeout=args.jetstream_timeout,
     )
 
     # Query

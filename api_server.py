@@ -13,7 +13,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple, Iterable
+from typing import Optional, List, Dict, Any, Tuple, Iterable, Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 from llm import LLMQuerySystem
+from chat_service import ChatService
 from course_embedder import CourseEmbedder
 
 # Configure logging
@@ -84,6 +85,40 @@ class QueryResponse(BaseModel):
     answer: str
     context: Optional[List[Dict[str, Any]]] = None
     success: bool
+    error: Optional[str] = None
+
+
+class ChatTurn(BaseModel):
+    """Represents a single chat exchange."""
+
+    role: Literal["user", "assistant", "system"] = Field(
+        default="user",
+        description="Speaker role for the message",
+    )
+    content: str = Field(..., description="Message contents", min_length=1)
+
+
+class ChatRequest(BaseModel):
+    """Request model for the chat endpoint."""
+
+    question: str = Field(..., description="Current user question", min_length=1)
+    history: List[ChatTurn] = Field(default_factory=list, description="Conversation history")
+    class_name: Optional[str] = Field(default=None, description="Course label for relevance checks")
+    collection_name: str = Field(default="cs_materials", description="Target Qdrant collection")
+    language: Optional[str] = Field(default="en", description="Language hint for the reply")
+    enable_guardrails: bool = Field(default=True, description="Toggle guardrails")
+    summarize_history: bool = Field(default=True, description="Summarize conversation history when long")
+
+
+class ChatResponse(BaseModel):
+    """Response model for chat endpoint."""
+
+    success: bool
+    answer: str
+    engine_results: List[Dict[str, Any]] = []
+    human_required: bool = False
+    summary: Optional[str] = None
+    relevance: Dict[str, Any] = {}
     error: Optional[str] = None
 
 
@@ -356,12 +391,18 @@ def get_llm_system(
         qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
 
         llm_systems[cache_key] = LLMQuerySystem(
+            collection_name=collection_name,
             qdrant_host=qdrant_host,
             qdrant_port=qdrant_port,
             enable_guardrails=enable_guardrails
         )
 
     return llm_systems[cache_key]
+
+
+chat_service = ChatService(
+    lambda collection, guardrails: get_llm_system(collection, guardrails)
+)
 
 
 def get_embedder(collection_name: str) -> CourseEmbedder:
@@ -560,6 +601,7 @@ async def root():
         "docs": "/docs",
         "endpoints": {
             "query": "/api/v1/query",
+            "chat": "/api/v1/chat",
             "embed": "/api/v1/embed",
             "delete": "/api/v1/embed (DELETE)",
             "quiz_generate": "/api/v1/quiz/generate",
@@ -649,6 +691,32 @@ async def query_llm(request: QueryRequest):
             answer="",
             success=False,
             error=str(e)
+        )
+
+
+@app.post("/api/v1/chat", response_model=ChatResponse)
+async def chat_with_assistant(request: ChatRequest):
+    """Chat endpoint that mirrors the legacy SAGE assistant flow."""
+
+    try:
+        payload = chat_service.handle_chat(
+            question=request.question,
+            history=[turn.model_dump() for turn in request.history],
+            class_name=request.class_name,
+            collection_name=request.collection_name,
+            language=request.language,
+            enable_guardrails=request.enable_guardrails,
+            summarize_history=request.summarize_history,
+        )
+        return ChatResponse(success=True, **payload)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.error(f"Chat request failed: {exc}", exc_info=True)
+        return ChatResponse(
+            success=False,
+            answer="",
+            engine_results=[],
+            human_required=True,
+            error=str(exc),
         )
 
 

@@ -48,6 +48,7 @@ class LLMQuerySystem:
             api_key: API token if connecting via the Open WebUI proxy (optional)
             request_timeout: Timeout (seconds) for Jetstream API requests
         """
+        # Force a healthy default model/base; can still be overridden by args/envs above
         base_url = (
             answer_base_url
             or rewrite_base_url
@@ -171,6 +172,40 @@ class LLMQuerySystem:
             top_p=0.9,
         )
 
+    def _format_history(self, history: Optional[List[Dict[str, str]]], limit: int = 8) -> str:
+        if not history:
+            return ""
+        trimmed = history[-limit:]
+        lines: List[str] = []
+        for turn in trimmed:
+            if not isinstance(turn, dict):
+                continue
+            role = (turn.get('role') or 'user').strip().lower()
+            if role not in {'user', 'assistant', 'system'}:
+                role = 'user'
+            content = (turn.get('content') or '').strip()
+            if not content:
+                continue
+            label = 'Student' if role == 'user' else 'Assistant' if role == 'assistant' else 'System'
+            lines.append(f"{label}: {content}")
+        return "\n".join(lines)
+
+    def _language_instruction(self, language_code: Optional[str]) -> str:
+        if not language_code:
+            return ""
+        code = language_code.strip().lower()
+        if not code or code in {"en", "english"}:
+            return ""
+        mapping = {
+            "zh": "Simplified Chinese",
+            "es": "Spanish",
+            "fr": "French",
+            "de": "German",
+            "ar": "Arabic",
+        }
+        target = mapping.get(code, language_code.strip())
+        return f" Please provide the response in {target}."
+
     def format_context(self, documents: List[Tuple[Dict[str, Any], float]]) -> str:
         """
         Format retrieved documents as context for the LLM.
@@ -205,7 +240,15 @@ class LLMQuerySystem:
 
         return '\n' + ('='*80) + '\n\n'.join(context_parts) + '\n' + ('='*80)
 
-    def query(self, user_query: str, show_context: bool = True, max_length: int = 2048):
+    def query(
+        self,
+        user_query: str,
+        show_context: bool = True,
+        max_length: int = 2048,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        precomputed_documents: Optional[List[Tuple[Dict[str, Any], float]]] = None,
+        response_language: Optional[str] = None,
+    ):
         """Query the Jetstream-backed LLM with optional RAG context."""
         # GUARDRAIL CHECKPOINT 1: Validate input query
         if self.enable_guardrails:
@@ -222,30 +265,40 @@ class LLMQuerySystem:
 
             print('='*80)
 
-        # QUERY REWRITING: Expand query for better RAG retrieval
-        print('\n' + '='*80)
-        print('QUERY REWRITING: Expanding query for RAG')
-        print('='*80)
-        print(f'Original query: "{user_query}"')
+        history_text = self._format_history(conversation_history)
 
-        rewritten_query = self._rewrite_query(user_query)
-        print(f'Rewritten query: "{rewritten_query}"')
-        print('='*80)
+        documents: List[Tuple[Dict[str, Any], float]] = []
 
-        # Stage 1 & 2: Perform RAG with two-stage reranking using rewritten query
-        print('\n' + '='*80)
-        print('RETRIEVING RELEVANT DOCUMENTS')
-        print('='*80)
+        if precomputed_documents is None:
+            # QUERY REWRITING: Expand query for better RAG retrieval
+            print('\n' + '='*80)
+            print('QUERY REWRITING: Expanding query for RAG')
+            print('='*80)
+            print(f'Original query: "{user_query}"')
 
-        documents = self.query_engine.search(
-            query=rewritten_query,
-            top_k=3,
-            use_reranker=True,
-            rerank_candidates=50,
-            stage1_top_k=7,
-            min_score=7.0,
-            verbose=True
-        )
+            rewritten_query = self._rewrite_query(user_query)
+            print(f'Rewritten query: "{rewritten_query}"')
+            print('='*80)
+
+            # Stage 1 & 2: Perform RAG with two-stage reranking using rewritten query
+            print('\n' + '='*80)
+            print('RETRIEVING RELEVANT DOCUMENTS')
+            print('='*80)
+
+            documents = self.query_engine.search(
+                query=rewritten_query,
+                top_k=3,
+                use_reranker=True,
+                rerank_candidates=50,
+                stage1_top_k=7,
+                min_score=7.0,
+                verbose=True
+            )
+        else:
+            documents = precomputed_documents
+            print('\n' + '='*80)
+            print('USING PRECOMPUTED CONTEXT DOCUMENTS')
+            print('='*80)
 
         use_rag = len(documents) > 0
         context = ''
@@ -267,20 +320,26 @@ class LLMQuerySystem:
             print('⚠ NO DOCUMENTS PASSED THRESHOLD - LLM will answer without RAG')
             print('='*80)
 
+        history_section = ''
+        if history_text:
+            history_section = f"Prior conversation:\n{history_text}\n\n"
+
+        language_instruction = self._language_instruction(response_language)
+
         if use_rag:
             prompt = f"""Based on the following course materials, please answer the question. Use the information from the documents to provide a comprehensive and accurate answer.
 
-{context}
+{history_section}{context}
 
 Question: {user_query}
 
-Answer:"""
+Answer:{language_instruction}"""
         else:
             prompt = f"""Please answer the following question to the best of your knowledge. Note that no relevant course materials were found with high enough confidence, so provide a general answer based on your training.
 
-Question: {user_query}
+{history_section}Question: {user_query}
 
-Answer:"""
+Answer:{language_instruction}"""
 
         # Generate response via Jetstream inference service
         print('\n' + '='*80)
@@ -370,13 +429,13 @@ def main():
         '--answer-base-url',
         type=str,
         default=os.environ.get('JETSTREAM_ANSWER_BASE_URL'),
-        help='Override Jetstream base URL for answer generation (default: https://llm.jetstream-cloud.org/gpt-oss-120b/v1)'
+        help='Override Jetstream base URL for answer generation (default: https://llm.jetstream-cloud.org/llama-4-scout/v1)'
     )
     parser.add_argument(
         '--answer-model',
         type=str,
         default=os.environ.get('JETSTREAM_ANSWER_MODEL'),
-        help='Override Jetstream model ID for answer generation (default: gpt-oss-120b)'
+        help='Override Jetstream model ID for answer generation (default: llama-4-scout)'
     )
     parser.add_argument(
         '--jetstream-api-key',

@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 from openai import OpenAI
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_BASE_URL = "https://llm.jetstream-cloud.org/llama-4-scout/v1"
+GENERIC_BASE_URL = "https://llm.jetstream-cloud.org/v1"
 DEFAULT_MODEL = "llama-4-scout"
+FALLBACK_MODEL = "gpt-oss-120b"
+FALLBACK_BASE_URL = "https://llm.jetstream-cloud.org/gpt-oss-120b/v1"
 DEFAULT_EMBED_MODEL = "Alibaba-NLP/gte-large-en-v1.5"
 
 JsonType = Union[Dict[str, Any], List[Any]]
@@ -45,23 +51,56 @@ class JetstreamInferenceClient:
         key = api_key if api_key is not None else _get_env("JETSTREAM_API_KEY")
         # The Jetstream direct endpoints ignore the token, but the OpenAI client expects something non-empty.
         self.api_key = key if key else "EMPTY"
-        self.client = OpenAI(base_url=self.base_url, api_key=self.api_key, timeout=timeout)
+        # Disable internal automatic retries to avoid multiple calls per user turn
+        self.client = OpenAI(base_url=self.base_url, api_key=self.api_key, timeout=timeout, max_retries=0)
         embed_base_url = _get_env("JETSTREAM_EMBED_BASE_URL")
         if embed_base_url:
-            self.embed_client = OpenAI(base_url=embed_base_url.rstrip("/"), api_key=self.api_key, timeout=timeout)
+            self.embed_client = OpenAI(
+                base_url=embed_base_url.rstrip("/"),
+                api_key=self.api_key,
+                timeout=timeout,
+                max_retries=0,
+            )
         else:
             self.embed_client = self.client
         self.embed_model = _get_env("JETSTREAM_EMBED_MODEL", DEFAULT_EMBED_MODEL)
 
     def chat_completion(self, messages: Sequence[Dict[str, Any]], **kwargs: Any) -> str:
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=list(messages),
-                **kwargs,
-            )
-        except Exception as exc:  # pragma: no cover - network/transport errors
-            raise RuntimeError(f"Jetstream inference request failed: {exc}") from exc
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):  # primary plus a single retry to limit spam
+            try:
+                return self._make_request(self.client, self.model, messages, **kwargs)
+            except Exception as exc:  # pragma: no cover - network/transport errors
+                last_exc = exc
+                logger.warning(
+                    "Primary model %s attempt %s failed: %s", self.model, attempt + 1, exc
+                )
+
+        # If primary still failing, try fallback
+        if self.model != FALLBACK_MODEL:
+            try:
+                fallback_client = OpenAI(
+                    base_url=FALLBACK_BASE_URL,
+                    api_key=self.api_key,
+                    timeout=self.client.timeout,
+                    max_retries=0,
+                )
+                logger.warning(
+                    "Falling back from %s to %s after failures", self.model, FALLBACK_MODEL
+                )
+                return self._make_request(fallback_client, FALLBACK_MODEL, messages, **kwargs)
+            except Exception as fallback_exc:  # pragma: no cover - network/transport errors
+                last_exc = fallback_exc
+                logger.error("Fallback model %s also failed: %s", FALLBACK_MODEL, fallback_exc)
+
+        raise RuntimeError(f"Jetstream inference request failed: {last_exc}") from last_exc
+
+    def _make_request(self, client: OpenAI, model: str, messages: Sequence[Dict[str, Any]], **kwargs: Any) -> str:
+        response = client.chat.completions.create(
+            model=model,
+            messages=list(messages),
+            **kwargs,
+        )
 
         if not response.choices:
             raise RuntimeError("Jetstream inference request returned no choices")

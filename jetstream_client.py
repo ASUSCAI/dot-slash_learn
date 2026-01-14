@@ -11,8 +11,8 @@ from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BASE_URL = "https://llm.jetstream-cloud.org/llama-4-scout/v1"
-GENERIC_BASE_URL = "https://llm.jetstream-cloud.org/v1"
+OPEN_WEBUI_BASE_URL = "https://llm.jetstream-cloud.org/api"
+DEFAULT_DIRECT_BASE_URL = "https://llm.jetstream-cloud.org/llama-4-scout/v1"
 DEFAULT_MODEL = "llama-4-scout"
 FALLBACK_MODEL = "gpt-oss-120b"
 FALLBACK_BASE_URL = "https://llm.jetstream-cloud.org/gpt-oss-120b/v1"
@@ -46,21 +46,34 @@ class JetstreamInferenceClient:
         api_key: Optional[str] = None,
         timeout: int = 120,
     ) -> None:
-        self.base_url = (base_url or _get_env("JETSTREAM_BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
-        self.model = model or _get_env("JETSTREAM_MODEL", DEFAULT_MODEL)
+        requested_base = base_url or _get_env("JETSTREAM_BASE_URL")
         key = api_key if api_key is not None else _get_env("JETSTREAM_API_KEY")
-        # The Jetstream direct endpoints ignore the token, but the OpenAI client expects something non-empty.
-        self.api_key = key if key else "EMPTY"
-        # Disable internal automatic retries to avoid multiple calls per user turn
-        self.client = OpenAI(base_url=self.base_url, api_key=self.api_key, timeout=timeout, max_retries=0)
+
+        prefer_open_webui = _bool_env("JETSTREAM_USE_OPEN_WEBUI", False)
+
+        effective_base = requested_base
+        if not effective_base:
+            if prefer_open_webui or key:
+                effective_base = OPEN_WEBUI_BASE_URL
+            else:
+                effective_base = DEFAULT_DIRECT_BASE_URL
+
+        self.base_url = effective_base.rstrip("/")
+        self.using_open_webui = self.base_url.endswith("/api") or "/api" in self.base_url.split("?")[0]
+        self.model = model or _get_env("JETSTREAM_MODEL", DEFAULT_MODEL)
+
+        # The Jetstream direct endpoints ignore the token, but Open WebUI requires a bearer token.
+        self.api_key = key if key else ("EMPTY" if not self.using_open_webui else "")
+        if self.using_open_webui and not self.api_key:
+            raise RuntimeError(
+                "JETSTREAM_API_KEY is required when using the Open WebUI proxy (set JETSTREAM_API_KEY in the environment)."
+            )
+
+        self.client = OpenAI(base_url=self.base_url, api_key=self.api_key or "EMPTY", timeout=timeout)
+
         embed_base_url = _get_env("JETSTREAM_EMBED_BASE_URL")
         if embed_base_url:
-            self.embed_client = OpenAI(
-                base_url=embed_base_url.rstrip("/"),
-                api_key=self.api_key,
-                timeout=timeout,
-                max_retries=0,
-            )
+            self.embed_client = OpenAI(base_url=embed_base_url.rstrip("/"), api_key=self.api_key or "EMPTY", timeout=timeout)
         else:
             self.embed_client = self.client
         self.embed_model = _get_env("JETSTREAM_EMBED_MODEL", DEFAULT_EMBED_MODEL)
@@ -143,7 +156,13 @@ class JetstreamInferenceClient:
                 **kwargs,
             )
         except Exception as exc:  # pragma: no cover - network/transport errors
-            raise RuntimeError(f"Jetstream embedding request failed: {exc}") from exc
+            message = str(exc)
+            if self.using_open_webui and "404" in message:
+                raise RuntimeError(
+                    "Jetstream embedding request failed: Open WebUI does not expose the embeddings API. "
+                    "Set JETSTREAM_EMBED_BASE_URL to a reachable embeddings endpoint or use local embedding support."
+                ) from exc
+            raise RuntimeError(f"Jetstream embedding request failed: {message}") from exc
 
         data = getattr(response, "data", None)
         if not data:

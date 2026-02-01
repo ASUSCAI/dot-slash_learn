@@ -30,7 +30,7 @@ from jetstream_client import JetstreamInferenceClient, _get_env
 DEFAULT_BATCH_SIZE = 10
 
 class DocumentReranker:
-    """Jetstream-based reranker for search results with batch prompting optimization."""
+    """Jetstream-based reranker for search results."""
 
     def __init__(
         self,

@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 HUMAN_ESCALATION_MESSAGE = (
     "I couldn't locate supporting course materials. Please contact your instructor or TA for additional guidance."
 )
+GENERAL_KNOWLEDGE_DISCLAIMER = (
+    "\n\n---\n*Note: This answer is based on general knowledge, not your course materials. "
+    "It may not reflect your instructor's specific expectations. Please verify with course resources or your instructor.*"
+)
 IRRELEVANT_MESSAGE = (
     "I can only help with questions about this course. Please ask about course topics, assignments, or materials."
 )
@@ -77,29 +81,24 @@ class ChatService:
                     }
                 ]
 
-        # Use a lightweight reranker (small candidate set) to limit LLM calls.
         documents = system.query_engine.search(
             query=question,
             top_k=3,
             use_reranker=True,
-            rerank_candidates=12,
+            rerank_candidates=20,
             stage1_top_k=5,
-            min_score=7.0,
+            min_score=4.5,
             verbose=False,
         )
         engine_results = self._format_engine_results(documents)
 
         if not documents:
-            return {
-                "answer": HUMAN_ESCALATION_MESSAGE,
-                "engine_results": engine_results,
-                "human_required": True,
-                "summary": summary_text,
-                "relevance": {
-                    "is_relevant": True,
-                    "explanation": relevance_reason,
-                },
-            }
+            logger.warning(
+                "Chat search returned 0 documents for q=%r collection=%s "
+                "(all candidates scored below min_score threshold)",
+                question,
+                collection_name,
+            )
 
         answer = system.query(
             question,
@@ -110,10 +109,13 @@ class ChatService:
             response_language=language,
         )
 
+        if not documents:
+            answer += GENERAL_KNOWLEDGE_DISCLAIMER
+
         return {
             "answer": answer,
             "engine_results": engine_results,
-            "human_required": False,
+            "human_required": not documents,
             "summary": summary_text,
             "relevance": {
                 "is_relevant": True,

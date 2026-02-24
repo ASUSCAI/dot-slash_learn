@@ -21,9 +21,12 @@ Usage:
         print(f"File: {result['payload']['file_path']}")
 '''
 
+import logging
 from typing import List, Dict, Any, Tuple, Optional
 
 from jetstream_client import JetstreamInferenceClient, _get_env
+
+logger = logging.getLogger(__name__)
 
 
 # Default batch size for batch prompting (10 is a safe value that balances API call reduction with accuracy)
@@ -220,9 +223,20 @@ class DocumentReranker:
         # Filter by minimum score if specified
         if min_score is not None:
             original_count = len(reranked)
-            reranked = [(result, score) for result, score in reranked if score >= min_score]
-            if self.verbose and original_count > len(reranked):
-                print(f'  Filtered out {original_count - len(reranked)} documents below threshold {min_score:.1f}')
+            filtered_out = [(r, s) for r, s in reranked if s < min_score]
+            reranked = [(r, s) for r, s in reranked if s >= min_score]
+            if filtered_out:
+                dropped = original_count - len(reranked)
+                scores_summary = ", ".join(
+                    f"{r.get('payload', r).get('file_path', '?').split('/')[-1]}={s:.1f}"
+                    for r, s in filtered_out[:5]
+                )
+                logger.info(
+                    "Reranker filtered %d/%d docs below min_score=%.1f (top dropped: %s)",
+                    dropped, original_count, min_score, scores_summary,
+                )
+                if self.verbose:
+                    print(f'  Filtered out {dropped} documents below threshold {min_score:.1f}')
 
         if self.verbose:
             print()

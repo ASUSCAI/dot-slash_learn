@@ -1,4 +1,9 @@
-"""Utilities for loading and using the local Alibaba-NLP/gte-large-en-v1.5 embedder."""
+"""Utilities for loading and using local embedding models with query/passage prefix support.
+
+Supported prefix conventions (auto-detected from model name):
+  - E5 family (intfloat/e5-*): "query: " / "passage: "
+  - Other models: no prefix (override via constructor args if needed)
+"""
 
 from __future__ import annotations
 
@@ -10,6 +15,16 @@ import torch
 from sentence_transformers import SentenceTransformer
 
 DEFAULT_MODEL = "Alibaba-NLP/gte-large-en-v1.5"
+
+
+def _detect_prefixes(model_name: str) -> tuple[str, str]:
+    """Return (query_prefix, passage_prefix) for known model families."""
+    name_lower = model_name.lower()
+    # E5 family requires "query: " / "passage: " prefixes.
+    # https://huggingface.co/intfloat/e5-large-v2#faq
+    if "/e5-" in name_lower or "-e5-" in name_lower or name_lower.startswith("e5-"):
+        return "query: ", "passage: "
+    return "", ""
 
 
 def _get_env(name: str, default: str | None = None) -> str | None:
@@ -34,7 +49,13 @@ def _load_sentence_transformer(model_name: str, device: str, trust_remote_code: 
 
 
 class LocalEmbeddingClient:
-    """Thin wrapper around the SentenceTransformer embedder."""
+    """Thin wrapper around the SentenceTransformer embedder with prefix support.
+
+    Models like E5 require specific prefixes on queries vs passages for optimal
+    accuracy.  This client auto-detects the convention from the model name and
+    exposes ``embed_query`` / ``embed_passages`` helpers that prepend them
+    automatically.
+    """
 
     def __init__(
         self,
@@ -44,6 +65,8 @@ class LocalEmbeddingClient:
         batch_size: int | None = None,
         normalize_embeddings: bool | None = None,
         trust_remote_code: bool | None = None,
+        query_prefix: str | None = None,
+        passage_prefix: str | None = None,
     ) -> None:
         self.model_name = model_name or _get_env("LOCAL_EMBED_MODEL", DEFAULT_MODEL)
 
@@ -74,7 +97,16 @@ class LocalEmbeddingClient:
         self._model = _load_sentence_transformer(self.model_name, self.device, self.trust_remote_code)
         self.dimension = int(self._model.get_sentence_embedding_dimension())
 
-    def embed(self, texts: Union[str, Sequence[str]]) -> List[List[float]]:
+        detected_q, detected_p = _detect_prefixes(self.model_name)
+        self.query_prefix = query_prefix if query_prefix is not None else detected_q
+        self.passage_prefix = passage_prefix if passage_prefix is not None else detected_p
+
+    # ------------------------------------------------------------------
+    # Core embedding
+    # ------------------------------------------------------------------
+
+    def embed(self, texts: Union[str, Sequence[str]], *, prefix: str = "") -> List[List[float]]:
+        """Embed one or more texts, optionally prepending *prefix* to each."""
         if isinstance(texts, str):
             batch: List[str] = [texts]
         else:
@@ -82,6 +114,9 @@ class LocalEmbeddingClient:
 
         if not batch:
             return []
+
+        if prefix:
+            batch = [prefix + t for t in batch]
 
         embeddings = self._model.encode(
             batch,
@@ -99,6 +134,21 @@ class LocalEmbeddingClient:
             vector.detach().cpu().numpy().tolist() if hasattr(vector, "detach") else list(vector)  # type: ignore[misc]
             for vector in cast(Iterable, embeddings)
         ]
+
+    # ------------------------------------------------------------------
+    # Convenience methods with automatic prefix handling
+    # ------------------------------------------------------------------
+
+    def embed_query(self, text: str) -> List[float]:
+        """Embed a single query string with the model's query prefix."""
+        results = self.embed(text, prefix=self.query_prefix)
+        if not results:
+            raise RuntimeError("Embedding returned no vector for query")
+        return results[0]
+
+    def embed_passages(self, texts: Union[str, Sequence[str]]) -> List[List[float]]:
+        """Embed one or more passages/documents with the model's passage prefix."""
+        return self.embed(texts, prefix=self.passage_prefix)
 
 
 __all__ = ["LocalEmbeddingClient", "DEFAULT_MODEL"]

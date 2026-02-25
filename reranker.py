@@ -109,12 +109,10 @@ class DocumentReranker:
             {
                 "role": "system",
                 "content": (
-                    "You are a relevance scoring assistant for an educational RAG system. "
-                    "You will be given a query and multiple documents. Score each document's relevance "
-                    "to the query on a scale from 0 to 10 (10 = highly relevant, 0 = not relevant). "
-                    "Respond with a JSON object containing a 'scores' array with one object per document. "
-                    "Each object should have 'doc_id' (integer) and 'score' (float 0-10). "
-                    "Example response: {\"scores\": [{\"doc_id\": 0, \"score\": 8.5}, {\"doc_id\": 1, \"score\": 3.2}]}"
+                    "You are a relevance scoring assistant. "
+                    "Score each document's relevance to the query from 0 to 10. "
+                    "Reply with ONLY a JSON object — no explanation, no markdown, no reasoning. "
+                    "Format: {\"scores\": [{\"doc_id\": 0, \"score\": 8.5}, {\"doc_id\": 1, \"score\": 3.2}]}"
                 ),
             },
             {
@@ -123,32 +121,88 @@ class DocumentReranker:
             },
         ]
 
+        # Step 1: Get raw text from LLM so we can log it before JSON parsing
         try:
-            # Increase max_tokens based on number of documents (roughly 30 tokens per doc score)
             max_tokens = max(200, len(documents) * 40)
-            assessment = self.jetstream_client.chat_completion_json(messages, max_tokens=max_tokens, temperature=0)
+            raw_text = self.jetstream_client.chat_completion(messages, max_tokens=max_tokens, temperature=0)
         except RuntimeError as exc:
-            if self.verbose:
-                print(f'  ⚠ Batch reranker error: {exc}')
-            # Return zeros for all documents on error
+            logger.error("Batch reranker LLM call failed for %d docs: %s", len(documents), exc)
             return [0.0] * len(documents)
 
-        # Parse the batch response
-        scores = [0.0] * len(documents)  # Default to 0 for any missing scores
+        logger.info("Reranker raw LLM response (%d docs): %s", len(documents), raw_text[:500])
 
-        scores_list = assessment.get('scores', [])
-        if isinstance(scores_list, list):
-            for item in scores_list:
-                if isinstance(item, dict):
-                    doc_id = item.get('doc_id')
-                    score = item.get('score')
-                    if doc_id is not None and score is not None:
-                        try:
-                            idx = int(doc_id)
-                            if 0 <= idx < len(documents):
-                                scores[idx] = max(0.0, min(float(score), 10.0))
-                        except (TypeError, ValueError):
-                            continue
+        # Step 2: Parse JSON from the raw text
+        from jetstream_client import _extract_json_payload
+        assessment = _extract_json_payload(raw_text)
+
+        if assessment is None:
+            logger.error(
+                "Reranker JSON parse failed for %d docs. Full raw text:\n%s",
+                len(documents), raw_text,
+            )
+            return [0.0] * len(documents)
+
+        logger.info("Reranker parsed JSON type=%s keys=%s",
+                     type(assessment).__name__,
+                     list(assessment.keys()) if isinstance(assessment, dict) else f"list[{len(assessment)}]")
+
+        scores = [0.0] * len(documents)
+
+        # Normalize response shape: the LLM may return
+        #   {"scores": [...]}, [{"doc_id":0,"score":8.5},...], or [8.5, 3.2, ...]
+        if isinstance(assessment, list):
+            scores_list = assessment
+        elif isinstance(assessment, dict):
+            scores_list = assessment.get('scores', assessment.get('results', []))
+        else:
+            scores_list = []
+
+        if not isinstance(scores_list, list) or not scores_list:
+            logger.warning(
+                "Reranker could not locate scores array in response for %d docs. Parsed payload: %s",
+                len(documents), assessment,
+            )
+            return scores
+
+        first = scores_list[0]
+        logger.info("Reranker scores_list format: len=%d first_item_type=%s first_item=%s",
+                     len(scores_list), type(first).__name__, str(first)[:200])
+
+        # Flat-number array: [8.5, 3.2, ...]
+        if not isinstance(first, dict):
+            for idx, val in enumerate(scores_list):
+                if idx < len(documents):
+                    try:
+                        scores[idx] = max(0.0, min(float(val), 10.0))
+                    except (TypeError, ValueError):
+                        continue
+            logger.info("Reranker flat-array scores: %s", scores)
+            return scores
+
+        # Object array: [{"doc_id": 0, "score": 8.5}, ...]
+        logger.info("Reranker object-array keys in first item: %s", list(first.keys()))
+        for item in scores_list:
+            if not isinstance(item, dict):
+                continue
+            doc_id = next((item[k] for k in ('doc_id', 'id', 'document_id') if item.get(k) is not None), None)
+            score = next((item[k] for k in ('score', 'relevance', 'relevance_score') if item.get(k) is not None), None)
+            if doc_id is not None and score is not None:
+                try:
+                    idx = int(doc_id)
+                    if 0 <= idx < len(documents):
+                        scores[idx] = max(0.0, min(float(score), 10.0))
+                except (TypeError, ValueError):
+                    continue
+            else:
+                logger.warning("Reranker could not extract doc_id/score from item: %s", item)
+
+        logger.info("Reranker final scores: %s", scores)
+
+        if all(s == 0.0 for s in scores):
+            logger.warning(
+                "Reranker returned all-zero scores for %d docs. Full parsed response: %s",
+                len(documents), assessment,
+            )
 
         return scores
 
@@ -191,7 +245,7 @@ class DocumentReranker:
             if payload.get('description'):
                 doc_context += f"Description: {payload.get('description', '')}\n"
 
-            document_text = payload.get('content_preview', '')
+            document_text = payload.get('full_content', '') or payload.get('content_preview', '')
             doc_context += f"\nContent:\n{document_text}"
 
             doc_contexts.append(doc_context)

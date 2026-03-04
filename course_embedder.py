@@ -43,6 +43,13 @@ from qdrant_client.models import (
 from jetstream_client import JetstreamInferenceClient, _get_env
 from local_embedding import LocalEmbeddingClient
 
+_SENTENCE_END_RE = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
+
+_CODE_EXTENSIONS = frozenset({
+    '.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.cpp', '.c', '.h', '.hpp',
+    '.rb', '.go', '.rs', '.kt', '.scala', '.r', '.m', '.swift', '.sh', '.bash',
+})
+
 
 class CourseEmbedder:
 
@@ -289,17 +296,14 @@ class CourseEmbedder:
                 print(f'Error reading file {file_path}: {e}')
                 return ''
 
-    def chunk_text(self, text: str) -> List[str]:
-        """
-        Split text into overlapping chunks using sentence boundaries.
+    def chunk_text(self, text: str, is_code: bool = False) -> List[str]:
+        """Split text into overlapping chunks respecting natural boundaries.
 
-        Strategy:
-        1. Split by sentences (using periods, exclamation marks, question marks)
-        2. Group sentences into chunks targeting self.chunk_size words
-        3. Overlap chunks by self.chunk_overlap words for context continuity
+        For prose: paragraphs -> lines -> sentences -> words.
+        For code:  function/class defs -> blank lines -> individual lines.
 
-        Returns:
-            List of text chunks
+        Each chunk targets ``self.chunk_size`` words with
+        ``self.chunk_overlap`` words of overlap between neighbours.
         """
         if not text.strip():
             return []
@@ -308,20 +312,143 @@ class CourseEmbedder:
         if not words:
             return []
 
-        chunks: List[str] = []
-        chunk_words: List[str] = []
+        if len(words) <= self.chunk_size:
+            return [text.strip()]
 
-        for word in words:
-            chunk_words.append(word)
-            if len(chunk_words) >= self.chunk_size:
-                chunks.append(' '.join(chunk_words))
-                if self.chunk_overlap > 0:
-                    chunk_words = chunk_words[-self.chunk_overlap:]
+        segments = (
+            self._split_code_segments(text) if is_code
+            else self._split_prose_segments(text)
+        )
+
+        if not segments:
+            return [text.strip()]
+
+        return self._merge_segments(segments)
+
+    # ------------------------------------------------------------------
+    # Segment splitters
+    # ------------------------------------------------------------------
+
+    def _split_prose_segments(self, text: str) -> List[str]:
+        """Break prose into paragraph- or sentence-level segments."""
+        paragraphs = re.split(r'\n\s*\n', text)
+        segments: List[str] = []
+
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+
+            if len(para.split()) <= self.chunk_size:
+                segments.append(para)
+                continue
+
+            # Paragraph too long — try splitting on line breaks first
+            # (PDF-extracted text often has one sentence per line)
+            lines = para.split('\n')
+            if len(lines) > 1:
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if len(line.split()) <= self.chunk_size:
+                        segments.append(line)
+                    else:
+                        self._split_long_prose(line, segments)
+            else:
+                self._split_long_prose(para, segments)
+
+        return segments
+
+    def _split_long_prose(self, text: str, out: List[str]) -> None:
+        """Break a long run of text on sentence boundaries, then words."""
+        sentences = _SENTENCE_END_RE.split(text)
+        if len(sentences) > 1:
+            for sent in sentences:
+                sent = sent.strip()
+                if sent:
+                    out.append(sent)
+        else:
+            words = text.split()
+            for i in range(0, len(words), self.chunk_size):
+                chunk = ' '.join(words[i:i + self.chunk_size])
+                if chunk:
+                    out.append(chunk)
+
+    def _split_code_segments(self, text: str) -> List[str]:
+        """Break source code into segments at definition or blank-line boundaries."""
+        blocks = re.split(r'\n(?=(?:def |class |async def ))', text)
+
+        if len(blocks) <= 1:
+            blocks = re.split(r'\n\s*\n', text)
+
+        segments: List[str] = []
+        for block in blocks:
+            block = block.strip()
+            if not block:
+                continue
+
+            if len(block.split()) <= self.chunk_size:
+                segments.append(block)
+                continue
+
+            sub_blocks = re.split(r'\n\s*\n', block)
+            for sub in sub_blocks:
+                sub = sub.strip()
+                if not sub:
+                    continue
+                if len(sub.split()) <= self.chunk_size:
+                    segments.append(sub)
                 else:
-                    chunk_words = []
+                    lines = sub.split('\n')
+                    acc_lines: List[str] = []
+                    acc_wc = 0
+                    for line in lines:
+                        line_wc = max(len(line.split()), 1)
+                        if acc_wc + line_wc > self.chunk_size and acc_lines:
+                            segments.append('\n'.join(acc_lines))
+                            acc_lines = []
+                            acc_wc = 0
+                        acc_lines.append(line)
+                        acc_wc += line_wc
+                    if acc_lines:
+                        segments.append('\n'.join(acc_lines))
 
-        if chunk_words:
-            chunks.append(' '.join(chunk_words))
+        return segments
+
+    # ------------------------------------------------------------------
+    # Segment merger with overlap
+    # ------------------------------------------------------------------
+
+    def _merge_segments(self, segments: List[str]) -> List[str]:
+        """Merge segments into chunks of ~chunk_size words with overlap."""
+        chunks: List[str] = []
+        current: List[str] = []
+        current_wc = 0
+
+        for segment in segments:
+            seg_wc = len(segment.split())
+
+            if current_wc + seg_wc > self.chunk_size and current:
+                chunks.append('\n\n'.join(current))
+
+                overlap: List[str] = []
+                overlap_wc = 0
+                for seg in reversed(current):
+                    swc = len(seg.split())
+                    if overlap_wc + swc > self.chunk_overlap and overlap:
+                        break
+                    overlap.insert(0, seg)
+                    overlap_wc += swc
+
+                current = overlap
+                current_wc = overlap_wc
+
+            current.append(segment)
+            current_wc += seg_wc
+
+        if current:
+            chunks.append('\n\n'.join(current))
 
         return chunks
 
@@ -331,7 +458,7 @@ class CourseEmbedder:
             return [0.0] * self.vector_size
 
         try:
-            embeddings = self.embedding_client.embed(text)
+            embeddings = self.embedding_client.embed_passages(text)
         except Exception as exc:
             raise RuntimeError(f'Local embedding failed: {exc}') from exc
 
@@ -387,8 +514,8 @@ class CourseEmbedder:
 
                 print(f'    Content length: {len(text_content)} characters')
 
-                # Chunk the document
-                chunks = self.chunk_text(text_content)
+                is_code = file_ext in _CODE_EXTENSIONS
+                chunks = self.chunk_text(text_content, is_code=is_code)
                 print(f'    Split into {len(chunks)} chunks')
 
                 # Create a point for each chunk
@@ -631,7 +758,7 @@ class CourseEmbedder:
             filename = os.path.basename(file_path)
             print(f'- Chunking: {filename}')
 
-            chunks = self.chunk_text(text_content)
+            chunks = self.chunk_text(text_content, is_code=(file_type == 'code'))
             print(f'    Split into {len(chunks)} chunks')
 
             for chunk_idx, chunk in enumerate(chunks):

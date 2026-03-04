@@ -76,11 +76,8 @@ class QueryEngine:
             raise e
 
     def embed_query(self, query: str) -> List[float]:
-        """Embed the query using the same model as course materials"""
-        embeddings = self.embedding_client.embed(query)
-        if not embeddings:
-            raise RuntimeError('Local embedding request returned no vector for query')
-        return embeddings[0]
+        """Embed the query using the same model as course materials."""
+        return self.embedding_client.embed_query(query)
 
     def search(self, query: str, top_k: int = 3, use_reranker: bool = False, rerank_candidates: int = 50, stage1_top_k: int = 7, min_score: float = 7.0, verbose: bool = True):
         """

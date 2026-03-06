@@ -327,7 +327,7 @@ class LLMQuerySystem:
         language_instruction = self._language_instruction(response_language)
 
         if use_rag:
-            prompt = f"""Based on the following course materials, please answer the question. Use the information from the documents to provide a comprehensive and accurate answer.
+            prompt = f"""Based on the following course materials, please answer the question. Use the information from the documents to provide a comprehensive and accurate answer. When referencing information from the source documents, mention the source by name (e.g., "According to [document title]...") so students can verify the answer.
 
 {history_section}{context}
 

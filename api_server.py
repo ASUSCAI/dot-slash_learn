@@ -108,6 +108,7 @@ class ChatRequest(BaseModel):
     language: Optional[str] = Field(default="en", description="Language hint for the reply")
     enable_guardrails: bool = Field(default=True, description="Toggle guardrails")
     summarize_history: bool = Field(default=True, description="Summarize conversation history when long")
+    fallback_behavior: Optional[str] = Field(default="both", description="Behavior when no documents found: general_knowledge, escalate, or both")
 
 
 class ChatResponse(BaseModel):
@@ -117,6 +118,8 @@ class ChatResponse(BaseModel):
     answer: str
     engine_results: List[Dict[str, Any]] = []
     human_required: bool = False
+    fallback_behavior: Optional[str] = None
+    suggested_post: Optional[str] = None
     summary: Optional[str] = None
     relevance: Dict[str, Any] = {}
     error: Optional[str] = None
@@ -707,6 +710,7 @@ async def chat_with_assistant(request: ChatRequest):
             language=request.language,
             enable_guardrails=request.enable_guardrails,
             summarize_history=request.summarize_history,
+            fallback_behavior=request.fallback_behavior or "both",
         )
         return ChatResponse(success=True, **payload)
     except Exception as exc:  # pragma: no cover - defensive logging

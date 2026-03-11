@@ -910,7 +910,16 @@ async def delete_files(request: DeleteFileRequest):
             for warning in resolution_warnings:
                 logger.warning("Delete request warning: %s", warning)
 
-        if not resolved_pairs:
+        deduped_pairs: List[Tuple[str, Path]] = []
+        seen_resolved_paths: set[str] = set()
+        for original_path, resolved_path in resolved_pairs:
+            resolved_key = str(resolved_path)
+            if resolved_key in seen_resolved_paths:
+                continue
+            seen_resolved_paths.add(resolved_key)
+            deduped_pairs.append((original_path, resolved_path))
+
+        if not deduped_pairs:
             message = "No valid file paths could be resolved for deletion."
             return DeleteFileResponse(
                 success=False,
@@ -930,8 +939,9 @@ async def delete_files(request: DeleteFileRequest):
         total_chunks_deleted = 0
         files_deleted = 0
         errors = list(resolution_warnings)
+        delete_failures: List[str] = []
 
-        for original_path, resolved_path in resolved_pairs:
+        for original_path, resolved_path in deduped_pairs:
             logger.info("  Deleting: %s (requested: %s)", resolved_path, original_path)
             result = embedder.delete_file(str(resolved_path))
 
@@ -939,20 +949,25 @@ async def delete_files(request: DeleteFileRequest):
                 total_chunks_deleted += result['chunks_deleted']
                 if result['chunks_deleted'] > 0:
                     files_deleted += 1
-                else:
-                    errors.append(f"No chunks found for: {original_path}")
             else:
-                errors.append(
+                delete_failures.append(
                     f"Failed to delete {original_path}: {result.get('error', 'Unknown error')}"
                 )
 
-        success = files_deleted > 0 or (len(errors) == 0 and len(request.file_paths) > 0)
+        errors.extend(delete_failures)
+        success = len(delete_failures) == 0
+        if files_deleted > 0:
+            message = f"Successfully deleted {files_deleted} files ({total_chunks_deleted} chunks)"
+        elif success:
+            message = "No matching chunks found for the requested files."
+        else:
+            message = "Deletion failed for one or more files."
 
         response = DeleteFileResponse(
             success=success,
             chunks_deleted=total_chunks_deleted,
             files_deleted=files_deleted,
-            message=f"Successfully deleted {files_deleted} files ({total_chunks_deleted} chunks)",
+            message=message,
             errors=errors
         )
 

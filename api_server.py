@@ -162,9 +162,9 @@ class EmbedRequest(BaseModel):
         default=None,
         description="Canvas module item identifiers included in this embed request"
     )
-    file_metadata: Optional[List[Dict[str, Optional[str]]]] = Field(
+    file_metadata: Optional[List[Dict[str, Any]]] = Field(
         default=None,
-        description="Per-file metadata including module_item_id references"
+        description="Per-file metadata to attach to embedded chunks"
     )
     ingested_at: Optional[str] = Field(
         default=None,
@@ -744,31 +744,26 @@ async def embed_files(request: EmbedRequest):
         )
         resolved_paths = [str(resolved) for _, resolved in resolved_pairs]
 
-        metadata_by_original: Dict[str, Any] = {}
+        metadata_by_original: Dict[str, Dict[str, Any]] = {}
         if request.file_metadata:
             for entry in request.file_metadata:
                 if isinstance(entry, dict):
-                    file_path_value = entry.get("file_path")
+                    entry_copy = dict(entry)
+                    file_path_value = entry_copy.get("file_path")
                     if not file_path_value:
                         continue
-                    try:
-                        parsed_entry = EmbedResponse.FileMetadataEntry(**entry)
-                    except Exception:
-                        logger.warning("Skipping invalid file metadata entry: %s", entry)
-                        continue
-                    metadata_by_original[str(file_path_value)] = parsed_entry
-                else:
-                    metadata_by_original[entry.file_path] = entry
+                    metadata_by_original[str(file_path_value)] = entry_copy
 
         file_metadata_map: Dict[str, Dict[str, Any]] = {}
         for original, resolved in resolved_pairs:
-            metadata_entry = metadata_by_original.get(original)
-            requested_path = original
-            payload_metadata: Dict[str, Any] = {
-                "requested_path": metadata_entry.requested_path if metadata_entry else requested_path,
-            }
-            if metadata_entry and metadata_entry.module_item_id is not None:
-                payload_metadata["module_item_id"] = metadata_entry.module_item_id
+            metadata_entry = metadata_by_original.get(original) or {}
+            payload_metadata: Dict[str, Any] = dict(metadata_entry)
+            payload_metadata.pop("file_path", None)
+            payload_metadata["requested_path"] = str(
+                payload_metadata.get("requested_path") or original
+            )
+            if payload_metadata.get("module_item_id") is not None:
+                payload_metadata["module_item_id"] = str(payload_metadata["module_item_id"])
             file_metadata_map[str(resolved)] = payload_metadata
 
         if resolution_warnings:

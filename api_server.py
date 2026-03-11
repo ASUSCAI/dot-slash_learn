@@ -752,7 +752,7 @@ async def embed_files(request: EmbedRequest):
                     if not file_path_value:
                         continue
                     try:
-                        parsed_entry = FileMetadataEntry(**entry)
+                        parsed_entry = EmbedResponse.FileMetadataEntry(**entry)
                     except Exception:
                         logger.warning("Skipping invalid file metadata entry: %s", entry)
                         continue
